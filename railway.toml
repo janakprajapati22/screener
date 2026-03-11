@@ -1,7 +1,7 @@
 [build]
-builder = "NIXPACKS"
+builder = "nixpacks"
 
 [deploy]
 startCommand = "gunicorn nifty_scanner:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120"
-restartPolicyType = "ON_FAILURE"
+restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

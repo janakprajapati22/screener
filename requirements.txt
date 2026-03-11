@@ -1,6 +1,9 @@
-requests==2.31.0
-pandas==2.2.2
-numpy==1.26.4
 flask==3.0.3
 flask-cors==4.0.1
+pandas==2.2.2
+numpy==1.26.4
+yfinance==0.2.54
 gunicorn==22.0.0
+requests==2.32.3
+kiteconnect==5.0.1
+pyotp==2.9.0

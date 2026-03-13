@@ -1740,42 +1740,16 @@ def _fetch_daily(days: int = 365, from_date: str = None, to_date: str = None) ->
     No limit on days — years of data available.
     Falls back to Kite 5m if yfinance unavailable (auto-aggregates to daily).
     """
-    now = datetime.now(IST)
-    if from_date:
-        from_dt = datetime.strptime(from_date, "%Y-%m-%d")
-        start   = (from_dt - timedelta(days=60)).strftime("%Y-%m-%d")
-        end     = to_date or now.strftime("%Y-%m-%d")
-    else:
-        start = (now - timedelta(days=days + 60)).strftime("%Y-%m-%d")
-        end   = now.strftime("%Y-%m-%d")
-
-    # ── Try Kite first (reliable, no rate limits) ─────────────────────────
-    if _kite_active():
-        try:
-            log.info(f"  Kite daily ^NSEI: {start} → {end}")
-            with kite_lock:
-                kc = kite_session
-            from_dt_obj = datetime.strptime(start, "%Y-%m-%d")
-            to_dt_obj   = datetime.strptime(end,   "%Y-%m-%d")
-            records = kc.historical_data(NIFTY_TOKEN, from_dt_obj, to_dt_obj, "day", continuous=False)
-            if records and len(records) >= 10:
-                df = pd.DataFrame(records)
-                df = df.rename(columns={"date":"datetime","open":"Open","high":"High",
-                                        "low":"Low","close":"Close","volume":"Volume"})
-                df = df.set_index("datetime")
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize(IST)
-                else:
-                    df.index = df.index.tz_convert(IST)
-                df = df[["Open","High","Low","Close","Volume"]].dropna()
-                log.info(f"  Kite daily: {len(df)} candles")
-                return df
-        except Exception as e:
-            log.warning(f"Kite daily failed: {e}")
-
-    # ── yfinance fallback (works locally, may be rate-limited on cloud) ───
     try:
         import yfinance as yf
+        now = datetime.now(IST)
+        if from_date:
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+            start   = (from_dt - timedelta(days=60)).strftime("%Y-%m-%d")
+            end     = to_date or now.strftime("%Y-%m-%d")
+        else:
+            start = (now - timedelta(days=days + 60)).strftime("%Y-%m-%d")
+            end   = now.strftime("%Y-%m-%d")
         log.info(f"  yfinance daily ^NSEI: {start} → {end}")
         df = yf.Ticker("^NSEI").history(start=start, end=end, interval="1d", auto_adjust=True)
         if df.empty:
@@ -1789,6 +1763,20 @@ def _fetch_daily(days: int = 365, from_date: str = None, to_date: str = None) ->
         return df
     except Exception as e:
         log.warning(f"yfinance daily failed: {e}")
+        import traceback; traceback.print_exc()
+    # Kite fallback — fetch 5m and resample to daily
+    if _kite_active():
+        log.info("  Falling back to Kite (5m → daily resample)")
+        try:
+            df5 = kite_history_multi(min(days, 390))
+            if df5.empty:
+                return pd.DataFrame()
+            df = df5.resample("1D").agg({
+                "Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"
+            }).dropna()
+            return df
+        except Exception as e2:
+            log.warning(f"Kite fallback failed: {e2}")
     return pd.DataFrame()
 
 

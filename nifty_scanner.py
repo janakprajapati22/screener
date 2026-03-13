@@ -51,7 +51,48 @@ IST           = ZoneInfo("Asia/Kolkata")
 PORT          = int(os.environ.get("PORT", 5050))
 SCAN_INTERVAL = 300       # full signal scan every 5 min
 PRICE_INTERVAL = 3        # price + option LTP poll every 3 sec
-LOT_SIZE      = 50        # Nifty lot size
+# Nifty lot size — fetched dynamically from Kite instruments, fallback to known value
+LOT_SIZE      = 65        # Fallback — overridden at runtime by fetch_lot_size()
+
+
+def _est_premium(spot: float, dte: int = 3, iv_pct: float = 22.0) -> float:
+    """
+    Estimate ATM option premium using simplified Black-Scholes.
+    ATM premium ≈ spot * IV * sqrt(DTE/365) * 0.4
+    Default IV=22% — back-solved from real Nifty weekly options (Mar 2026).
+    e.g. Nifty 23450 PE at DTE=4, IV=23% → ₹~229 actual vs ₹229 estimate ✓
+    Old method (spot*1.5%) gave ₹351 — 53% overestimate.
+    """
+    import math
+    iv   = iv_pct / 100.0
+    t    = max(dte, 0.5) / 365.0
+    prem = spot * iv * math.sqrt(t) * 0.4
+    return round(max(prem, 10.0), 2)  # floor ₹10
+
+def _dte(trade_date) -> int:
+    """Days to expiry from trade_date."""
+    from datetime import date as date_type
+    expiry = _get_expiry_for_date(trade_date)
+    if isinstance(trade_date, date_type):
+        return max((expiry.date() - trade_date).days, 0)
+    return max((expiry.date() - trade_date.date()).days, 0)
+
+def fetch_lot_size() -> int:
+    """Fetch current Nifty lot size from Kite instruments API."""
+    global LOT_SIZE
+    try:
+        instruments = kite.instruments("NFO")
+        for inst in instruments:
+            if inst.get("name") == "NIFTY" and inst.get("instrument_type") == "CE":
+                lot = int(inst.get("lot_size", 0))
+                if lot > 0:
+                    LOT_SIZE = lot
+                    log.info(f"✅ Lot size fetched from Kite: {LOT_SIZE}")
+                    return lot
+    except Exception as e:
+        log.warning(f"Could not fetch lot size from Kite: {e}")
+    log.info(f"Using fallback lot size: {LOT_SIZE}")
+    return LOT_SIZE
 
 # Signal thresholds
 EMA_FAST, EMA_SLOW, EMA_TREND = 9, 21, 50
@@ -68,9 +109,16 @@ OPTION_SL_PCT    = 0.35   # SL: exit if premium drops 35% (tighter than 40%)
 OPTION_TP_PCT    = 0.80   # TP: exit if premium gains 80%
 STRADDLE_SL_PCT  = 0.25   # Straddle SL: exit if premium rises 25%
 STRADDLE_TP_PCT  = 0.50   # Straddle TP: collect 50% premium decay
-TRAILING_SL      = True   # Enable trailing SL after 40% profit
-TRAILING_TRIGGER = 0.40   # Start trailing after +40% gain
-TRAILING_LOCK    = 0.20   # Lock in 20% gain once trailing activates
+TRAILING_SL      = True   # Enable trailing SL
+# Dynamic trailing levels: (profit_threshold, lock_in_gain)
+TRAILING_LEVELS  = [(0.40, 0.10), (0.60, 0.25), (1.00, 0.50)]
+
+# Risk guardrails
+MAX_DAILY_LOSS_PCT = 0.03   # Stop trading at -3% of capital
+MAX_TRADES_DAY     = 3      # Max 3 trades per day
+TRADE_COOLDOWN_MIN = 10     # 10 min between trades
+MIN_PREMIUM        = 80     # Skip options below ₹80 premium
+SLIPPAGE_PCT       = 0.005  # 0.5% slippage each side simulation
 
 # ─── ZERODHA CONFIG ───────────────────────────────────────────────────────────
 RAILWAY_URL      = os.environ.get("RAILWAY_URL", "https://nifty-screener-production.up.railway.app")
@@ -172,6 +220,7 @@ def _auto_login():
             kite_session = kc
         _save_token(access_token)
         log.info(f"✅ Auto-login success: {profile.get('user_name')}")
+        fetch_lot_size()
         return True
     except Exception as e:
         log.error(f"Auto-login error: {e}")
@@ -475,7 +524,8 @@ def fetch_oi_pcr(spot_price: float) -> dict:
         pe_syms = [build_option_symbol(s, "PE") for s in strikes]
         all_syms = ce_syms + pe_syms
 
-        data = kc.ltp(all_syms)
+        # Use kite.quote() — ltp() does NOT return OI data
+        data = kc.quote(all_syms)
 
         total_ce_oi = 0
         total_pe_oi = 0
@@ -484,8 +534,6 @@ def fetch_oi_pcr(spot_price: float) -> dict:
         for sym, val in data.items():
             oi = val.get("oi", 0) or 0
             lp = val.get("last_price", 0) or 0
-            # Identify CE or PE
-            is_ce = any(s.replace("NFO:", "") in sym for s in ce_syms if s.replace("NFO:", "") in sym)
             if "CE" in sym:
                 total_ce_oi += oi
             elif "PE" in sym:
@@ -554,7 +602,7 @@ def fetch_oi_pcr(spot_price: float) -> dict:
                 "atm_iv": 0, "atm_iv_ce": 0, "atm_iv_pe": 0, "iv_regime": "UNKNOWN"}
 
 # ─── SHARED STATE ──────────────────────────────────────────────────────────────
-state_lock = threading.Lock()
+state_lock = threading.RLock()  # Reentrant — safe for nested acquisitions
 state = {
     "nifty":        {"price": 0, "change": 0, "pct": 0, "prev": 0},
     "options":      {"atm": 0, "ce_ltp": 0, "pe_ltp": 0, "straddle_premium": 0,
@@ -576,7 +624,7 @@ state = {
 
 # ─── PAPER TRADING ─────────────────────────────────────────────────────────────
 PAPER_FILE  = "paper_trades_v5.json"   # fallback if no DB
-paper_lock  = threading.Lock()
+paper_lock  = threading.RLock()
 paper_state = {
     "open_trades":    [],
     "closed_trades":  [],
@@ -719,13 +767,13 @@ def open_paper_trade(direction: str, symbol: str, entry_ltp: float,
         sl  = round(entry_ltp * (1 - OPTION_SL_PCT), 2)
         tp  = round(entry_ltp * (1 + OPTION_TP_PCT), 2)
         trade = {
-            "id":         now.strftime("%H%M%S"),
-            "direction":  direction,       # BUY_CE, BUY_PE, SELL_CE_PE (straddle)
+            "id":         now.strftime("%H%M%S%f"),
+            "direction":  direction,
             "symbol":     symbol,
-            "opt_type":   opt_type,        # CE / PE / STRADDLE
+            "opt_type":   opt_type,
             "strike":     strike,
             "entry_ltp":  entry_ltp,
-            "entry_time": now.strftime("%H:%M:%S"),
+            "entry_time": now.strftime("%Y-%m-%d %H:%M:%S"),
             "spot_entry": spot_price,
             "sl":         sl,
             "tp":         tp,
@@ -796,17 +844,21 @@ def check_paper_trades(current_options: dict):
             t["pnl_rs"]  = round(pnl_pts * t["qty"], 2)
             t["pnl_pct"] = round(pnl_pts / t["entry_ltp"] * 100, 1) if t["entry_ltp"] else 0
 
-            # ── Trailing SL: lock profits once +40% gained ────────────
+            # ── Dynamic Trailing SL — 3 levels ────────────────────────
+            # profit>40% → lock +10% | profit>60% → lock +25% | profit>100% → lock +50%
             if TRAILING_SL and "BUY" in t["direction"] and cur_ltp > 0:
                 gain_pct = (cur_ltp - t["entry_ltp"]) / t["entry_ltp"]
-                if gain_pct >= TRAILING_TRIGGER:
-                    # Lock in 20% gain — trail SL up
-                    locked_sl = round(t["entry_ltp"] * (1 + TRAILING_LOCK), 2)
-                    if locked_sl > t["sl"]:
-                        if t.get("trailing_active") != True:
-                            log.info(f"🔒 TRAILING SL activated: {sym} | SL moved ₹{t['sl']} → ₹{locked_sl}")
-                        t["sl"] = locked_sl
-                        t["trailing_active"] = True
+                new_sl   = t["sl"]
+                for trigger, lock in TRAILING_LEVELS:
+                    if gain_pct >= trigger:
+                        candidate = round(t["entry_ltp"] * (1 + lock), 2)
+                        if candidate > new_sl:
+                            new_sl = candidate
+                if new_sl > t["sl"]:
+                    if not t.get("trailing_active"):
+                        log.info(f"🔒 TRAILING SL: {sym} | SL ₹{t['sl']} → ₹{new_sl} (gain {gain_pct*100:.0f}%)")
+                    t["sl"]             = new_sl
+                    t["trailing_active"] = True
 
             # ── SL / TP / Square-off check ─────────────────────────────
             hit = None
@@ -928,13 +980,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ─── MARKET MOOD ENGINE ────────────────────────────────────────────────────────
 def detect_mood(df: pd.DataFrame) -> dict:
     """
-    Detect market regime.
-    PRIMARY: ADX + RSI (reliable)
-    SECONDARY: VWAP, EMA cross (confirmation only, not blocker)
+    Hierarchical market regime detection.
+    Order: TRENDING → SIDEWAYS → CHOPPY (only one fires)
 
-    TRENDING UP   : ADX > 22, RSI > 52, 2/3 of (price>VWAP, EMA9>EMA21, ST bull)
-    TRENDING DOWN : ADX > 22, RSI < 48, 2/3 of (price<VWAP, EMA9<EMA21, ST bear)
-    SIDEWAYS      : ADX < 20, ATR% < 0.5%
+    TRENDING UP   : 4/5 of (ADX>22, RSI>55, Price>VWAP, EMA9>EMA21, ST=bull)
+    TRENDING DOWN : 4/5 of (ADX>22, RSI<45, Price<VWAP, EMA9<EMA21, ST=bear)
+    SIDEWAYS      : ADX<20, ATR%<1.6%, Price within ±0.4% of VWAP
     CHOPPY        : everything else
     """
     if len(df) < 20:
@@ -952,23 +1003,28 @@ def detect_mood(df: pd.DataFrame) -> dict:
     st    = int(row["ST_trend"])
     squeeze = bool((row["BB_UP"] <= row["KC_UP"]) and (row["BB_DN"] >= row["KC_DN"]))
 
-    # Count secondary confirmations
-    bull_confirms = sum([price > vwap, ema9 > ema21, st == 1])
-    bear_confirms = sum([price < vwap, ema9 < ema21, st == -1])
+    # 5-condition trending score
+    bull_score = sum([adx > 22, rsi > 55, price > vwap, ema9 > ema21, st == 1])
+    bear_score = sum([adx > 22, rsi < 45, price < vwap, ema9 < ema21, st == -1])
 
-    if adx > 22 and rsi > 52 and bull_confirms >= 2:
+    # SIDEWAYS: strict — all 3 must pass
+    vwap_band  = abs(price - vwap) / vwap if vwap > 0 else 1
+    is_sideways = adx < 20 and atr_p < 0.016 and vwap_band < 0.004
+
+    # ── Hierarchical: trending first ───────────────────────────────────────
+    if bull_score >= 4:
         return {"regime": "TRENDING_UP",   "label": "📈 Trending Up",   "color": "green",
                 "adx": round(adx,1), "rsi": round(rsi,1), "atr_pct": round(atr_p*100,2),
                 "squeeze": squeeze, "strategy": "BUY_CE",
-                "confirms": f"{bull_confirms}/3 confirms"}
+                "confirms": f"{bull_score}/5 conditions"}
 
-    elif adx > 22 and rsi < 48 and bear_confirms >= 2:
+    if bear_score >= 4:
         return {"regime": "TRENDING_DOWN", "label": "📉 Trending Down", "color": "red",
                 "adx": round(adx,1), "rsi": round(rsi,1), "atr_pct": round(atr_p*100,2),
                 "squeeze": squeeze, "strategy": "BUY_PE",
-                "confirms": f"{bear_confirms}/3 confirms"}
+                "confirms": f"{bear_score}/5 conditions"}
 
-    elif adx < 20 and atr_p < 0.005:
+    if is_sideways:
         # ── ORB: compute opening range (first 3 bars = 9:15–9:30) ──────
         orb_bars  = df.between_time("09:15", "09:29") if hasattr(df.index, 'time') else df.head(3)
         orb_info  = {}
@@ -1006,17 +1062,16 @@ def run_signal_engine(df: pd.DataFrame, mood: dict, vix: float = 0, oi_pcr: dict
     atm_iv     = oi_pcr.get("atm_iv", 0)
     iv_regime  = oi_pcr.get("iv_regime", "UNKNOWN")
 
-    # Straddle rules based on IV:
-    #   IV < 20% → straddle allowed (normal/low premium = decays well)
-    #   IV 20-25% → straddle with warning (premium expanded, risky)
-    #   IV > 25% → block straddle (premium too expensive, event risk)
-    straddle_iv_ok = atm_iv < 20 or atm_iv == 0   # 0 = unknown, allow
-    straddle_iv_warn = atm_iv >= 20 and atm_iv < 25
+    # IV regime for strategy switching
+    # IV < 15  → buy options (cheap, good for directional)
+    # IV 15-22 → normal
+    # IV > 22  → prefer selling (expensive premium, good for straddle/condor)
+    iv_buy_ok     = atm_iv < 15 or atm_iv == 0   # ideal for buying options
+    iv_sell_ok    = atm_iv > 22                    # ideal for selling (straddle/condor)
+    straddle_iv_ok    = atm_iv < 20 or atm_iv == 0
+    straddle_iv_warn  = 20 <= atm_iv < 25
     straddle_iv_block = atm_iv >= 25
 
-    # Directional rules:
-    #   IV > 20% → warn (buying expensive premium)
-    #   IV < 12% → ideal (cheap premium, good R:R for directional)
     vix_warn = ""
     if vix > 0:
         if vix > 20 and mood["regime"] in ("TRENDING_UP", "TRENDING_DOWN"):
@@ -1042,55 +1097,59 @@ def run_signal_engine(df: pd.DataFrame, mood: dict, vix: float = 0, oi_pcr: dict
     details = []
     score   = 0
 
+    # ── Weighted scoring: max=8, threshold=5 ─────────────────────────────────
+    # EMA trend=2, VWAP=2, Supertrend=1, RSI=1, Volume=1, PCR=1
     if mood["regime"] == "TRENDING_UP":
-        if ema9 > ema21:            score += 1; details.append("✅ EMA9>EMA21")
-        else:                       details.append("❌ EMA9<EMA21")
-        if ema21 > ema50:           score += 1; details.append("✅ EMA21>EMA50")
-        else:                       details.append("❌ EMA21<EMA50")
-        if price > vwap:            score += 1; details.append("✅ Price>VWAP")
-        else:                       details.append("❌ Price<VWAP")
-        if st == 1:                 score += 1; details.append("✅ Supertrend Bull")
-        else:                       details.append("❌ Supertrend Bear")
-        if rsi > 50:                score += 1; details.append(f"✅ RSI {rsi:.0f} Bullish")
-        else:                       details.append(f"❌ RSI {rsi:.0f} Weak")
-        if vol_ok:                  score += 1; details.append("✅ Volume spike")
-        else:                       details.append("⚪ Volume normal")
-        # PCR bonus
-        if pcr_sent == "BULLISH":   score += 1; details.append(f"✅ PCR {pcr} Bullish")
-        elif pcr_sent == "BEARISH": details.append(f"❌ PCR {pcr} Bearish — conflict")
-        else:                       details.append(f"⚪ PCR {pcr} Neutral")
-        # VIX warning (doesn't block, just warns)
+        if ema9 > ema21 and ema21 > ema50: score += 2; details.append("✅ EMA aligned bull (+2)")
+        elif ema9 > ema21:                 score += 1; details.append("✅ EMA9>EMA21 (+1)")
+        else:                              details.append("❌ EMA not aligned")
+        if price > vwap:                   score += 2; details.append("✅ Price>VWAP (+2)")
+        else:                              details.append("❌ Price<VWAP")
+        if st == 1:                        score += 1; details.append("✅ Supertrend Bull (+1)")
+        else:                              details.append("❌ Supertrend Bear")
+        if rsi > 55:                       score += 1; details.append(f"✅ RSI {rsi:.0f}>55 (+1)")
+        elif rsi > 50:                     details.append(f"⚪ RSI {rsi:.0f} weak bull")
+        else:                              details.append(f"❌ RSI {rsi:.0f} bearish")
+        if vol_ok:                         score += 1; details.append("✅ Volume spike (+1)")
+        else:                              details.append("⚪ Volume normal")
+        if pcr_sent == "BULLISH":          score += 1; details.append(f"✅ PCR {pcr} bullish (+1)")
+        elif pcr_sent == "BEARISH":        details.append(f"❌ PCR {pcr} bearish conflict")
+        else:                              details.append(f"⚪ PCR {pcr} neutral")
         if vix_warn: details.append(vix_warn)
+        details.append(f"📊 Score: {score}/8 (need ≥5)")
         if score >= MIN_SCORE:
             return {"trade": "BUY_CE", "strategy": "Directional BUY CE", "score": score, "details": details}
 
     elif mood["regime"] == "TRENDING_DOWN":
-        if ema9 < ema21:            score += 1; details.append("✅ EMA9<EMA21")
-        else:                       details.append("❌ EMA9>EMA21")
-        if ema21 < ema50:           score += 1; details.append("✅ EMA21<EMA50")
-        else:                       details.append("❌ EMA21>EMA50")
-        if price < vwap:            score += 1; details.append("✅ Price<VWAP")
-        else:                       details.append("❌ Price>VWAP")
-        if st == -1:                score += 1; details.append("✅ Supertrend Bear")
-        else:                       details.append("❌ Supertrend Bull")
-        if rsi < 50:                score += 1; details.append(f"✅ RSI {rsi:.0f} Bearish")
-        else:                       details.append(f"❌ RSI {rsi:.0f} Weak")
-        if vol_ok:                  score += 1; details.append("✅ Volume spike")
-        else:                       details.append("⚪ Volume normal")
-        # PCR bonus
-        if pcr_sent == "BEARISH":   score += 1; details.append(f"✅ PCR {pcr} Bearish")
-        elif pcr_sent == "BULLISH": details.append(f"❌ PCR {pcr} Bullish — conflict")
-        else:                       details.append(f"⚪ PCR {pcr} Neutral")
-        # VIX warning
+        if ema9 < ema21 and ema21 < ema50: score += 2; details.append("✅ EMA aligned bear (+2)")
+        elif ema9 < ema21:                  score += 1; details.append("✅ EMA9<EMA21 (+1)")
+        else:                               details.append("❌ EMA not aligned")
+        if price < vwap:                    score += 2; details.append("✅ Price<VWAP (+2)")
+        else:                               details.append("❌ Price>VWAP")
+        if st == -1:                        score += 1; details.append("✅ Supertrend Bear (+1)")
+        else:                               details.append("❌ Supertrend Bull")
+        if rsi < 45:                        score += 1; details.append(f"✅ RSI {rsi:.0f}<45 (+1)")
+        elif rsi < 50:                      details.append(f"⚪ RSI {rsi:.0f} weak bear")
+        else:                               details.append(f"❌ RSI {rsi:.0f} bullish")
+        if vol_ok:                          score += 1; details.append("✅ Volume spike (+1)")
+        else:                               details.append("⚪ Volume normal")
+        if pcr_sent == "BEARISH":           score += 1; details.append(f"✅ PCR {pcr} bearish (+1)")
+        elif pcr_sent == "BULLISH":         details.append(f"❌ PCR {pcr} bullish conflict")
+        else:                               details.append(f"⚪ PCR {pcr} neutral")
         if vix_warn: details.append(vix_warn)
+        details.append(f"📊 Score: {score}/8 (need ≥5)")
         if score >= MIN_SCORE:
             return {"trade": "BUY_PE", "strategy": "Directional BUY PE", "score": score, "details": details}
 
     # ── EXPIRY DAY STRADDLE — fires regardless of mood ──────────────────────
     now    = datetime.now(IST)
     expiry = is_expiry_day()
-    if expiry and now.hour < 11:
+    # Expiry day: 2 windows — 9:30-10:30 (theta starts) and 2:00-2:45 (theta peak)
+    expiry_window1 = expiry and (now.hour == 9 and now.minute >= 30 or now.hour == 10 and now.minute <= 30)
+    expiry_window2 = expiry and (now.hour == 14 and 0 <= now.minute <= 45)
+    if expiry_window1 or expiry_window2:
         vix_ok = vix < 18 if vix > 0 else True
+        window_label = "9:30-10:30 window" if expiry_window1 else "2:00-2:45 peak theta window"
         if straddle_iv_block:
             details.append(f"🚫 Expiry straddle BLOCKED — IV {atm_iv}% very high (event risk)")
         elif not vix_ok:
@@ -1099,13 +1158,12 @@ def run_signal_engine(df: pd.DataFrame, mood: dict, vix: float = 0, oi_pcr: dict
             iv_note = (f"⚠️ IV {atm_iv}% elevated — straddle risky" if straddle_iv_warn
                        else f"✅ IV {atm_iv}% [{iv_regime}] — good for straddle" if atm_iv > 0
                        else "⚪ IV unknown")
-            return {"trade": "STRADDLE", "strategy": "Expiry Day Straddle 🎯", "score": 5,
+            return {"trade": "STRADDLE", "strategy": f"Expiry Day Straddle 🎯 ({window_label})", "score": 5,
                     "details": [
-                        "✅ Expiry day — theta burns fastest",
+                        f"✅ Expiry day — {window_label}",
                         f"✅ VIX {vix} — premium fair" if vix > 0 else "⚪ VIX unknown",
                         iv_note,
                         f"⚪ PCR {pcr} — {pcr_sent}",
-                        "✅ Sell ATM straddle at 9:20 AM",
                     ]}
 
     elif mood["regime"] == "SIDEWAYS":
@@ -1114,11 +1172,19 @@ def run_signal_engine(df: pd.DataFrame, mood: dict, vix: float = 0, oi_pcr: dict
             if straddle_iv_block:
                 details.append(f"🚫 Straddle BLOCKED — IV {atm_iv}% too high")
             else:
-                iv_note = (f"⚠️ IV {atm_iv}% elevated" if straddle_iv_warn
-                           else f"✅ IV {atm_iv}% ideal" if atm_iv > 0 else "⚪ IV unknown")
-                return {"trade": "STRADDLE", "strategy": "9:20 Short Straddle", "score": 5,
-                        "details": ["✅ 9:20 AM window", "✅ ADX sideways", "✅ Low ATR",
-                                    iv_note, f"⚪ PCR {pcr}"]}
+                # Range filter: if opening 5-min range already > 0.4% → skip (too volatile)
+                open_bars = df.between_time("09:15","09:19") if hasattr(df.index,"time") else df.head(1)
+                open_range_pct = ((float(open_bars["High"].max()) - float(open_bars["Low"].min()))
+                                  / float(open_bars["Low"].min()) * 100) if len(open_bars) > 0 else 0
+                if open_range_pct > 0.4:
+                    details.append(f"⚠️ Opening range {open_range_pct:.2f}% > 0.4% — straddle risky, skip")
+                else:
+                    iv_note = (f"⚠️ IV {atm_iv}% elevated" if straddle_iv_warn
+                               else f"✅ IV {atm_iv}% ideal" if atm_iv > 0 else "⚪ IV unknown")
+                    return {"trade": "STRADDLE", "strategy": "9:20 Short Straddle", "score": 5,
+                            "details": ["✅ 9:20 AM window", "✅ ADX sideways", "✅ Low ATR",
+                                        f"✅ Open range {open_range_pct:.2f}% < 0.4%",
+                                        iv_note, f"⚪ PCR {pcr}"]}
         # Iron condor rest of day
         squeeze = mood.get("squeeze", False)
         if squeeze and adx < 20:
@@ -1134,7 +1200,9 @@ def run_signal_engine(df: pd.DataFrame, mood: dict, vix: float = 0, oi_pcr: dict
             orb_dir  = orb.get("direction")   # "UP" / "DOWN" / None
             orb_brk  = orb.get("breakout")    # True if broken
 
-            if orb_brk and orb_dir == "UP" and not straddle_iv_block:
+            orb_vol_ok = float(df.iloc[-1]["Volume"]) > float(df.iloc[-1]["Vol_MA"]) * 1.5 if df.iloc[-1]["Vol_MA"] > 0 else True
+            orb_already_fired = mood.get("orb_fired", False)
+            if orb_brk and orb_dir == "UP" and not straddle_iv_block and orb_vol_ok and not orb_already_fired:
                 iv_note = f"✅ IV {atm_iv}% ok" if atm_iv > 0 else "⚪ IV unknown"
                 return {"trade": "BUY_CE", "strategy": "ORB Breakout 📈", "score": 5,
                         "details": [
@@ -1195,7 +1263,8 @@ def _on_ticks(ws, ticks):
                     try:
                         opts = fetch_atm_options(p)
                         with state_lock:
-                            state["options"] = opts
+                            with state_lock:
+                                state["options"] = opts
                         check_paper_trades(opts)
                     except Exception as e:
                         log.warning(f"Option fetch failed: {e}")
@@ -1335,7 +1404,8 @@ def price_loop():
 
             elif not is_market_open():
                 with state_lock:
-                    state["market_open"] = False
+                    with state_lock:
+                        state["market_open"] = False
                 if ticker_started:
                     stop_ticker()
                     ticker_started = False
@@ -1390,7 +1460,7 @@ def run_scan():
             state["expiry_today"] = is_expiry_day()
             state["expiry_str"]   = get_weekly_expiry_str()
 
-        log.info(f"  Mood: {mood['regime']} | ADX:{mood['adx']} RSI:{mood['rsi']} | Signal: {sig['trade'] or 'NONE'} ({sig['score']}/5)")
+        log.info(f"  Mood: {mood['regime']} | ADX:{mood['adx']} RSI:{mood['rsi']} | Signal: {sig['trade'] or 'NONE'} ({sig['score']}/8 weighted)")
 
         # Auto open paper trade on signal
         if sig["trade"] and _kite_active():
@@ -1403,29 +1473,85 @@ def run_scan():
         log.error(f"Scan error: {e}")
 
 def _auto_paper_trade(sig: dict, spot: float, opts: dict):
-    """Auto open paper trade based on signal."""
+    """Auto open paper trade based on signal — with all guardrails."""
+    now = datetime.now(IST)
+
     with paper_lock:
         open_dirs = [t["direction"] for t in paper_state["open_trades"]]
         if sig["trade"] in open_dirs:
             return
+
+        # ── Daily guardrails ────────────────────────────────────────────────
+        stats     = paper_state["stats"]
+        capital   = stats.get("capital", 100000)
+        start_cap = stats.get("start_capital", 100000)
+
+        # Daily loss limit (-3%)
+        daily_pnl = stats.get("daily_pnl", 0)
+        if daily_pnl < -(start_cap * MAX_DAILY_LOSS_PCT):
+            log.info(f"🛑 Daily loss limit hit: ₹{daily_pnl:.0f} — no more trades today")
+            return
+
+        # Max trades per day
+        today_str    = now.strftime("%Y-%m-%d")
+        trades_today = sum(1 for t in paper_state["closed_trades"]
+                          if t.get("entry_time","")[:10] == today_str)
+        trades_today += len(paper_state["open_trades"])
+        if trades_today >= MAX_TRADES_DAY:
+            log.info(f"🛑 Max {MAX_TRADES_DAY} trades/day reached — skipping")
+            return
+
+        # Cooldown between trades
+        last_trade_time = stats.get("last_trade_time")
+        if last_trade_time:
+            try:
+                lt = datetime.fromisoformat(last_trade_time)
+                if (now - lt).total_seconds() < TRADE_COOLDOWN_MIN * 60:
+                    log.info(f"⏳ Trade cooldown — {TRADE_COOLDOWN_MIN}min between trades")
+                    return
+            except: pass
+
     # Send Telegram alert BEFORE opening trade
     tg_signal(sig, spot, opts)
 
-    trade = sig["trade"]
+    trade    = sig["trade"]
     strategy = sig["strategy"]
-    atm = opts.get("atm", round(spot / 50) * 50)
+    atm      = opts.get("atm", round(spot / 50) * 50)
 
     if trade == "BUY_CE":
-        ltp = opts.get("ce_ltp", 0)
-        if ltp <= 0: return
-        open_paper_trade("BUY_CE", opts.get("ce_sym", f"NIFTY{atm}CE"),
-                         ltp, strategy, spot, atm, "CE")
+        # Try 1 strike ITM first (better delta, less theta)
+        itm_strike = atm - 50 if spot > atm else atm
+        itm_sym    = build_option_symbol(itm_strike, "CE")
+        itm_ltp    = opts.get("all_ltps", {}).get(itm_sym, 0)
+        if itm_ltp >= MIN_PREMIUM:
+            ltp = round(itm_ltp * (1 + SLIPPAGE_PCT), 2)
+            open_paper_trade("BUY_CE", itm_sym.replace("NFO:",""),
+                             ltp, strategy, spot, itm_strike, "CE")
+        else:
+            # Fallback to ATM
+            ltp = opts.get("ce_ltp", 0)
+            if ltp < MIN_PREMIUM:
+                log.info(f"⚠️ CE premium ₹{ltp} < min ₹{MIN_PREMIUM} — skip"); return
+            ltp = round(ltp * (1 + SLIPPAGE_PCT), 2)
+            open_paper_trade("BUY_CE", opts.get("ce_sym", f"NIFTY{atm}CE"),
+                             ltp, strategy, spot, atm, "CE")
 
     elif trade == "BUY_PE":
-        ltp = opts.get("pe_ltp", 0)
-        if ltp <= 0: return
-        open_paper_trade("BUY_PE", opts.get("pe_sym", f"NIFTY{atm}PE"),
-                         ltp, strategy, spot, atm, "PE")
+        # Try 1 strike ITM first
+        itm_strike = atm + 50 if spot < atm + 50 else atm
+        itm_sym    = build_option_symbol(itm_strike, "PE")
+        itm_ltp    = opts.get("all_ltps", {}).get(itm_sym, 0)
+        if itm_ltp >= MIN_PREMIUM:
+            ltp = round(itm_ltp * (1 + SLIPPAGE_PCT), 2)
+            open_paper_trade("BUY_PE", itm_sym.replace("NFO:",""),
+                             ltp, strategy, spot, itm_strike, "PE")
+        else:
+            ltp = opts.get("pe_ltp", 0)
+            if ltp < MIN_PREMIUM:
+                log.info(f"⚠️ PE premium ₹{ltp} < min ₹{MIN_PREMIUM} — skip"); return
+            ltp = round(ltp * (1 + SLIPPAGE_PCT), 2)
+            open_paper_trade("BUY_PE", opts.get("pe_sym", f"NIFTY{atm}PE"),
+                             ltp, strategy, spot, atm, "PE")
 
     elif trade == "STRADDLE":
         ce_ltp = opts.get("ce_ltp", 0)
@@ -1455,30 +1581,293 @@ def scan_loop():
             log.error(f"Scan loop: {e}")
         time.sleep(SCAN_INTERVAL)
 
-# ─── BACKTEST ──────────────────────────────────────────────────────────────────
-def run_backtest(days: int = 60, from_date: str = None, to_date: str = None):
+# ─── YAHOO FINANCE HISTORY (no Kite required) ─────────────────────────────────
+def yf_history_multi(days: int = 60, from_date: str = None, to_date: str = None) -> pd.DataFrame:
     """
-    Detailed backtest with REAL option symbols + proper expiry dates.
-    Accepts either `days` (last N days) or `from_date`+`to_date` (YYYY-MM-DD).
-    Max 400 days — Kite API limit for 5-min candles.
+    Fetch Nifty 5-min OHLCV via yfinance — works WITHOUT Kite login.
+    yfinance 5m limit: last 60 days. Beyond that uses daily candles.
+    Falls back to Kite if yfinance fails.
     """
-    if not _kite_active():
-        return {}
     try:
-        fetch_days = days + 5
+        import yfinance as yf
+        now = datetime.now(IST)
         if from_date:
-            # Calculate how many days to fetch from today back to from_date
-            from_dt   = datetime.strptime(from_date, "%Y-%m-%d")
-            fetch_days = (datetime.now() - from_dt).days + 5
-            fetch_days = min(fetch_days, 405)
+            # fetch 60 extra days before from_date for indicator warmup
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+            start   = (from_dt - timedelta(days=60)).strftime("%Y-%m-%d")
+            end     = to_date or now.strftime("%Y-%m-%d")
+        else:
+            start = (now - timedelta(days=days + 3)).strftime("%Y-%m-%d")
+            end   = now.strftime("%Y-%m-%d")
 
-        log.info(f"📊 Running backtest ({days} days | {from_date or 'latest'} → {to_date or 'today'})...")
-        df_raw = kite_history_multi(fetch_days)
-        if df_raw.empty or len(df_raw) < 20:
-            return {}
+        span_days = (datetime.now() - datetime.strptime(start, "%Y-%m-%d")).days
+        interval  = "5m" if span_days <= 58 else "1d"
+        log.info(f"  yfinance ^NSEI: {interval} bars {start} → {end}")
+
+        df = yf.Ticker("^NSEI").history(start=start, end=end, interval=interval, auto_adjust=True)
+        if df.empty:
+            raise ValueError("Empty response from yfinance")
+
+        df = df[["Open","High","Low","Close","Volume"]].dropna()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+        log.info(f"  yfinance: got {len(df)} bars")
+        return df
+    except ImportError:
+        log.warning("yfinance not installed — run: pip install yfinance")
+    except Exception as e:
+        log.warning(f"yfinance failed: {e}")
+    # Fallback to Kite
+    if _kite_active():
+        log.info("  Falling back to Kite history")
+        return kite_history_multi(days)
+    return pd.DataFrame()
+
+# ─── BACKTEST (Daily bars — works for years of data via yfinance) ──────────────
+# ─── NSE BHAVCOPY (real option prices + lot size) ─────────────────────────────
+
+import urllib.request, zipfile, io as _io
+
+_bhavcopy_cache: dict = {}   # date_str → DataFrame
+
+
+def _fetch_bhavcopy(date_str: str) -> pd.DataFrame:
+    """
+    Fetch NSE F&O bhavcopy for a given date (YYYYMMDD).
+    Returns DataFrame with NIFTY options for that day.
+    Columns: SYMBOL, EXPIRY_DT, STRIKE_PR, OPTION_TYP, OPEN, HIGH, LOW, CLOSE, SETTLE_PR, CONTRACTS, LOT_SIZE
+    """
+    if date_str in _bhavcopy_cache:
+        return _bhavcopy_cache[date_str]
+
+    # Try new format first (2024+)
+    urls = [
+        f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{date_str}_F_0000.csv.zip",
+        # Older format fallback
+        f"https://archives.nseindia.com/content/fo/fo{datetime.strptime(date_str,'%Y%m%d').strftime('%d%b%Y').upper()}bhav.csv.zip",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "*/*",
+        "Referer": "https://www.nseindia.com/",
+    }
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                zdata = resp.read()
+            with zipfile.ZipFile(_io.BytesIO(zdata)) as z:
+                df = pd.read_csv(z.open(z.namelist()[0]))
+
+            # Normalise column names across formats
+            df.columns = [c.strip().upper() for c in df.columns]
+            col_map = {
+                "TCKRSYMB": "SYMBOL", "FINSTNM": "SYMBOL",
+                "XPRY_DT": "EXPIRY_DT", "EXPDT": "EXPIRY_DT",
+                "STRKPRIC": "STRIKE_PR", "STRK_PRC": "STRIKE_PR",
+                "OPTNTP": "OPTION_TYP", "OPT_TYP": "OPTION_TYP",
+                "OPNPRIC": "OPEN", "HGHPRIC": "HIGH", "LWPRIC": "LOW",
+                "CLSPRIC": "CLOSE", "STTLPRIC": "SETTLE_PR",
+                "TTLQTY": "CONTRACTS", "LOTSIZE": "LOT_SIZE",
+            }
+            df.rename(columns=col_map, inplace=True)
+
+            # Filter NIFTY options only
+            sym_col = "SYMBOL" if "SYMBOL" in df.columns else df.columns[0]
+            nifty = df[df[sym_col].astype(str).str.strip() == "NIFTY"].copy()
+
+            if nifty.empty:
+                continue
+
+            _bhavcopy_cache[date_str] = nifty
+            log.info(f"  Bhavcopy {date_str}: {len(nifty)} NIFTY option rows")
+            return nifty
+        except Exception as e:
+            log.debug(f"  Bhavcopy {url[:60]}… failed: {e}")
+
+    _bhavcopy_cache[date_str] = pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _get_option_price(date_str: str, strike: int, opt_type: str, expiry_str: str) -> float:
+    """
+    Get real ATM option close price from bhavcopy.
+    Falls back to spot * 1.5% estimate if not available.
+    """
+    d_fmt = date_str.replace("-", "")
+    bdf = _fetch_bhavcopy(d_fmt)
+    if bdf.empty:
+        return None
+
+    try:
+        # Match strike + option type
+        mask = (
+            (bdf["STRIKE_PR"].astype(float).astype(int) == int(strike)) &
+            (bdf["OPTION_TYP"].astype(str).str.strip().str.upper() == opt_type.upper())
+        )
+        row = bdf[mask]
+        if row.empty:
+            return None
+        price = float(row["SETTLE_PR"].iloc[0]) if "SETTLE_PR" in row.columns else float(row["CLOSE"].iloc[0])
+        return price if price > 0 else None
+    except Exception as e:
+        log.debug(f"  Option price lookup failed: {e}")
+        return None
+
+
+def _get_lot_size_from_bhavcopy(date_str: str) -> int:
+    """Get NIFTY lot size from bhavcopy for a specific date."""
+    d_fmt = date_str.replace("-", "")
+    bdf = _fetch_bhavcopy(d_fmt)
+    if bdf.empty or "LOT_SIZE" not in bdf.columns:
+        return LOT_SIZE
+    try:
+        lot = int(bdf["LOT_SIZE"].iloc[0])
+        return lot if lot > 0 else LOT_SIZE
+    except:
+        return LOT_SIZE
+
+
+def _fetch_daily(days: int = 365, from_date: str = None, to_date: str = None) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV for Nifty via yfinance.
+    No limit on days — years of data available.
+    Falls back to Kite 5m if yfinance unavailable (auto-aggregates to daily).
+    """
+    try:
+        import yfinance as yf
+        now = datetime.now(IST)
+        if from_date:
+            # fetch 60 extra days before from_date for indicator warmup
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+            start   = (from_dt - timedelta(days=60)).strftime("%Y-%m-%d")
+            end     = to_date or now.strftime("%Y-%m-%d")
+        else:
+            start = (now - timedelta(days=days + 60)).strftime("%Y-%m-%d")  # +60 days warmup for indicators
+            end   = now.strftime("%Y-%m-%d")
+        log.info(f"  yfinance daily ^NSEI: {start} → {end}")
+        df = yf.Ticker("^NSEI").history(start=start, end=end, interval="1d", auto_adjust=True)
+        if df.empty:
+            raise ValueError("Empty yfinance response")
+        df = df[["Open","High","Low","Close","Volume"]].dropna()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+        log.info(f"  yfinance daily: {len(df)} candles")
+        return df
+    except Exception as e:
+        log.warning(f"yfinance daily failed: {e}")
+        import traceback; traceback.print_exc()
+    # Kite fallback — fetch 5m and resample to daily
+    if _kite_active():
+        log.info("  Falling back to Kite (5m → daily resample)")
+        try:
+            df5 = kite_history_multi(min(days, 390))
+            if df5.empty:
+                return pd.DataFrame()
+            df = df5.resample("1D").agg({
+                "Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"
+            }).dropna()
+            return df
+        except Exception as e2:
+            log.warning(f"Kite fallback failed: {e2}")
+    return pd.DataFrame()
+
+
+def _compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute indicators on daily bars."""
+    c = df["Close"].astype(float)
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    v = df["Volume"].astype(float)
+
+    df = df.copy()
+    df["EMA9"]  = c.ewm(span=9,  adjust=False).mean()
+    df["EMA21"] = c.ewm(span=21, adjust=False).mean()
+    df["EMA50"] = c.ewm(span=50, adjust=False).mean()
+
+    delta = c.diff()
+    gain  = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+    df["RSI"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-9)))
+
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    df["ATR"]     = tr.ewm(span=14, adjust=False).mean()
+    df["ATR_pct"] = df["ATR"] / c
+
+    plus_dm  = (h.diff()).clip(lower=0)
+    minus_dm = (-l.diff()).clip(lower=0)
+    plus_dm[plus_dm   < minus_dm.values] = 0
+    minus_dm[minus_dm < plus_dm.values]  = 0
+    atr14 = tr.ewm(span=14, adjust=False).mean()
+    pdi   = 100 * plus_dm.ewm(span=14, adjust=False).mean()  / atr14.replace(0, 1e-9)
+    mdi   = 100 * minus_dm.ewm(span=14, adjust=False).mean() / atr14.replace(0, 1e-9)
+    dx    = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
+    df["ADX"] = dx.ewm(span=14, adjust=False).mean()
+
+    # VWAP on daily = (H+L+C)/3 rolling proxy
+    tp = (h + l + c) / 3
+    df["VWAP"] = tp.rolling(20).mean()
+
+    # Supertrend (daily)
+    hl2  = (h + l) / 2
+    atr3 = tr.ewm(span=10, adjust=False).mean()
+    upper = hl2 + 3.0 * atr3
+    lower = hl2 - 3.0 * atr3
+    trend = pd.Series(1, index=df.index)
+    lower_vals = lower.values.copy()
+    upper_vals = upper.values.copy()
+    trend_vals = trend.values.copy()
+    c_vals     = c.values
+    for i in range(1, len(df)):
+        u  = upper_vals[i]; l_ = lower_vals[i]
+        lower_vals[i] = l_ if (l_ > lower_vals[i-1] or c_vals[i-1] < lower_vals[i-1]) else lower_vals[i-1]
+        upper_vals[i] = u  if (u  < upper_vals[i-1] or c_vals[i-1] > upper_vals[i-1]) else upper_vals[i-1]
+        if   c_vals[i] > upper_vals[i-1]: trend_vals[i] = 1
+        elif c_vals[i] < lower_vals[i-1]: trend_vals[i] = -1
+        else:                             trend_vals[i] = trend_vals[i-1]
+    lower[:] = lower_vals
+    upper[:] = upper_vals
+    trend[:] = trend_vals
+    df["ST_trend"] = trend
+    df["Vol_MA"]   = v.rolling(20).mean()
+
+    return df.dropna(subset=["EMA9","RSI","ADX"])
+
+
+def _daily_mood(row) -> str:
+    """Classify market mood from a single daily bar."""
+    adx = float(row["ADX"]); rsi = float(row["RSI"])
+    p   = float(row["Close"]); vwap = float(row["VWAP"])
+    e9  = float(row["EMA9"]); e21 = float(row["EMA21"])
+    st  = int(row["ST_trend"]); atr_p = float(row["ATR_pct"])
+    bull = sum([p > vwap, e9 > e21, st == 1])
+    bear = sum([p < vwap, e9 < e21, st == -1])
+    if adx > 20 and rsi > 52 and bull >= 2:   return "TRENDING_UP"
+    if adx > 20 and rsi < 48 and bear >= 2:   return "TRENDING_DOWN"
+    if adx < 22 and atr_p < 0.020:            return "SIDEWAYS"
+    return "CHOPPY"
+
+
+def run_backtest(days: int = 365, from_date: str = None, to_date: str = None):
+    """
+    Daily-bar backtest — works for years of data via yfinance.
+    No Kite login required. Strategy logic on daily OHLC.
+    """
+    try:
+        log.info(f"📊 Backtest (daily bars): {days}d | {from_date or 'latest'} → {to_date or 'today'}")
+        df_raw = _fetch_daily(days, from_date=from_date, to_date=to_date)
+        print(f"[DEBUG] _fetch_daily returned {len(df_raw)} rows, empty={df_raw.empty}", flush=True)
+        if df_raw.empty or len(df_raw) < 15:
+            print(f"[DEBUG] Not enough data ({len(df_raw)} rows) — returning error", flush=True)
+            return {"error": f"No data ({len(df_raw)} rows) — install yfinance or connect Kite"}
+
+        df_raw = _compute_daily_indicators(df_raw)
         df_raw["date"] = df_raw.index.date
 
-        # Filter by date range if provided
         all_dates = sorted(df_raw["date"].unique())
         if from_date and to_date:
             from_d = datetime.strptime(from_date, "%Y-%m-%d").date()
@@ -1492,124 +1881,114 @@ def run_backtest(days: int = 60, from_date: str = None, to_date: str = None):
 
         log.info(f"  Backtest: {len(dates)} trading days")
 
-        results   = {"directional": {"trades":0,"wins":0,"pnl":0},
-                     "straddle":    {"trades":0,"wins":0,"pnl":0}}
+        results   = {"directional":{"trades":0,"wins":0,"pnl":0},
+                     "straddle":   {"trades":0,"wins":0,"pnl":0}}
         trade_log = []
         capital   = 100000.0
         LOT       = LOT_SIZE
 
-        for d in dates:
-            day = df_raw[df_raw["date"] == d].copy()
-            if len(day) < 15: continue
-            day  = compute_indicators(day)
-            mood = detect_mood(day)
-            date_str   = str(d)
-            expiry_str = _expiry_str_for_date(d)   # e.g. "18 Mar 2026"
-            weekday    = d.weekday()               # 0=Mon 1=Tue
+        for i, d in enumerate(dates):
+            row = df_raw[df_raw["date"] == d]
+            if row.empty: continue
+            row      = row.iloc[0]
+            mood     = _daily_mood(row)
+            weekday  = d.weekday()
+            if weekday > 4: continue  # skip weekends (yfinance sometimes includes them)
+            date_str = str(d)
+            expiry_str = _expiry_str_for_date(d)
+            # Use real lot size from bhavcopy if available
+            LOT = _get_lot_size_from_bhavcopy(date_str)
 
-            if mood["regime"] in ("TRENDING_UP", "TRENDING_DOWN"):
-                bar_idx    = min(4, len(day)-3)
-                bar        = day.iloc[bar_idx]
-                rest       = day.iloc[bar_idx+1:]
-                if rest.empty: continue
+            open_p  = float(row["Open"])
+            high_p  = float(row["High"])
+            low_p   = float(row["Low"])
+            close_p = float(row["Close"])
 
-                direction  = 1 if mood["regime"] == "TRENDING_UP" else -1
-                opt_type   = "CE" if direction == 1 else "PE"
-                entry_spot = float(bar["Close"])
-                entry_time = bar.name.strftime("%H:%M") if hasattr(bar.name, 'strftime') else "09:30"
-
-                # Real ATM strike + real option symbol
+            if mood in ("TRENDING_UP", "TRENDING_DOWN"):
+                direction = 1 if mood == "TRENDING_UP" else -1
+                opt_type  = "CE" if direction == 1 else "PE"
+                entry_spot = open_p   # enter at open
                 atm        = round(entry_spot / 50) * 50
                 nfo_sym    = build_option_symbol(atm, opt_type, trade_date=d)
-                prem_entry = round(entry_spot * 0.015, 2)
+                # Try real option price from bhavcopy, fall back to estimate
+                real_prem  = _get_option_price(date_str, atm, opt_type, expiry_str)
+                prem_entry = real_prem if real_prem else _est_premium(entry_spot, dte=_dte(d))
                 sl_prem    = round(prem_entry * (1 - OPTION_SL_PCT), 2)
                 tp_prem    = round(prem_entry * (1 + OPTION_TP_PCT), 2)
 
-                # Find exit bar + time
-                exit_time = "15:15"
+                # Daily bar outcome simulation
+                day_move_pct = (close_p - open_p) / open_p  # raw spot move
+                dir_move     = day_move_pct * direction       # positive = trend held
                 if direction == 1:
-                    hit_tp = any(float(r["High"]) >= entry_spot * 1.010 for _, r in rest.iterrows())
-                    hit_sl = any(float(r["Low"])  <= entry_spot * 0.993 for _, r in rest.iterrows())
-                    for ts, r in rest.iterrows():
-                        if float(r["High"]) >= entry_spot * 1.010:
-                            exit_time = ts.strftime("%H:%M") if hasattr(ts, 'strftime') else "15:15"
-                            break
-                        if float(r["Low"]) <= entry_spot * 0.993:
-                            exit_time = ts.strftime("%H:%M") if hasattr(ts, 'strftime') else "15:15"
-                            break
+                    hit_tp = high_p  >= entry_spot * 1.018
+                    hit_sl = low_p   <= entry_spot * 0.992
                 else:
-                    hit_tp = any(float(r["Low"])  <= entry_spot * 0.990 for _, r in rest.iterrows())
-                    hit_sl = any(float(r["High"]) >= entry_spot * 1.007 for _, r in rest.iterrows())
-                    for ts, r in rest.iterrows():
-                        if float(r["Low"]) <= entry_spot * 0.990:
-                            exit_time = ts.strftime("%H:%M") if hasattr(ts, 'strftime') else "15:15"
-                            break
-                        if float(r["High"]) >= entry_spot * 1.007:
-                            exit_time = ts.strftime("%H:%M") if hasattr(ts, 'strftime') else "15:15"
-                            break
+                    hit_tp = low_p   <= entry_spot * 0.982
+                    hit_sl = high_p  >= entry_spot * 1.008
 
-                if hit_tp and not hit_sl:
-                    result = "WIN";  exit_p = tp_prem;  pnl_pts = tp_prem - prem_entry
+                if hit_tp and hit_sl:
+                    if dir_move > 0:
+                        result = "WIN";       exit_p = tp_prem
+                    else:
+                        result = "LOSS";      exit_p = sl_prem
+                elif hit_tp:
+                    result = "WIN";           exit_p = tp_prem
                 elif hit_sl:
-                    result = "LOSS"; exit_p = sl_prem;  pnl_pts = sl_prem - prem_entry
+                    result = "LOSS";          exit_p = sl_prem
                 else:
-                    result = "SQUAREOFF"
-                    exit_p = round(float(rest.iloc[-1]["Close"]) * 0.010, 2)
-                    pnl_pts = exit_p - prem_entry; exit_time = "15:15"
+                    # Squareoff: option price reflects actual spot move (delta ~0.5 for ATM)
+                    opt_move = dir_move * 5.0  # ATM option moves ~5x spot (delta+gamma)
+                    opt_move = max(-0.60, min(0.80, opt_move))  # cap at -60%/+80%
+                    exit_p   = round(prem_entry * (1 + opt_move), 2)
+                    result   = "WIN" if opt_move > 0 else "SQUAREOFF"
 
-                pnl_rs   = round(pnl_pts * LOT, 2)
+                pnl_rs   = round((exit_p - prem_entry) * LOT, 2)
                 capital += pnl_rs
                 results["directional"]["trades"] += 1
                 results["directional"]["pnl"]    += pnl_rs
                 if result == "WIN": results["directional"]["wins"] += 1
 
                 trade_log.append({
-                    "date":        date_str,
-                    "weekday":     ["Mon","Tue","Wed","Thu","Fri"][weekday],
-                    "strategy":    f"Directional {opt_type}",
-                    "mood":        mood["regime"],
-                    "symbol":      nfo_sym.replace("NFO:",""),
-                    "strike":      atm,
-                    "opt_type":    opt_type,
-                    "expiry":      expiry_str,
-                    "spot_entry":  round(entry_spot, 2),
-                    "entry":       prem_entry,
-                    "sl":          sl_prem,
-                    "tp":          tp_prem,
-                    "exit":        exit_p,
-                    "entry_time":  entry_time,
-                    "exit_time":   exit_time,
-                    "result":      result,
-                    "pnl_rs":      round(pnl_rs, 0),
-                    "pnl_pct":     round(pnl_pts / prem_entry * 100, 1),
-                    "capital":     round(capital, 0),
-                    "adx":         mood["adx"],
-                    "rsi":         mood["rsi"],
-                    "lots":        1,
+                    "date":       date_str,
+                    "weekday":    ["Mon","Tue","Wed","Thu","Fri"][weekday],
+                    "strategy":   f"Directional {opt_type}",
+                    "mood":       mood,
+                    "symbol":     nfo_sym.replace("NFO:",""),
+                    "strike":     atm,
+                    "opt_type":   opt_type,
+                    "expiry":     expiry_str,
+                    "spot_entry": round(entry_spot, 2),
+                    "entry":      prem_entry,
+                    "sl":         sl_prem,
+                    "tp":         tp_prem,
+                    "exit":       exit_p,
+                    "entry_time": "09:15",
+                    "exit_time":  "15:15",
+                    "result":     result,
+                    "pnl_rs":     round(pnl_rs, 0),
+                    "pnl_pct":    round((exit_p - prem_entry) / prem_entry * 100, 1),
+                    "capital":    round(capital, 0),
+                    "adx":        round(float(row["ADX"]),1),
+                    "rsi":        round(float(row["RSI"]),1),
+                    "lots":       1,
                 })
 
-            elif mood["regime"] == "SIDEWAYS":
-                open_p    = float(day["Close"].iloc[0])
-                close_p   = float(day["Close"].iloc[-1])
-                move_pct  = abs(close_p - open_p) / open_p
-                atm       = round(open_p / 50) * 50
-                ce_sym    = build_option_symbol(atm, "CE", trade_date=d).replace("NFO:","")
-                pe_sym    = build_option_symbol(atm, "PE", trade_date=d).replace("NFO:","")
-                strad_sym = f"{ce_sym} + {pe_sym}"
-
-                # Estimate each leg: ~1% of spot per side
-                ce_prem   = round(open_p * 0.010, 2)
-                pe_prem   = round(open_p * 0.010, 2)
-                strad_prem = round(ce_prem + pe_prem, 2)
+            elif mood == "SIDEWAYS":
+                atm        = round(open_p / 50) * 50
+                ce_sym     = build_option_symbol(atm, "CE", trade_date=d).replace("NFO:","")
+                pe_sym     = build_option_symbol(atm, "PE", trade_date=d).replace("NFO:","")
+                strad_sym  = f"{ce_sym} + {pe_sym}"
+                ce_real = _get_option_price(date_str, atm, "CE", expiry_str)
+                pe_real = _get_option_price(date_str, atm, "PE", expiry_str)
+                strad_prem = round((ce_real + pe_real), 2) if ce_real and pe_real else round(_est_premium(open_p, dte=_dte(d)) * 2, 2)
+                move_pct   = abs(close_p - open_p) / open_p
 
                 if move_pct < 0.015:
-                    result  = "WIN"
-                    exit_p  = round(strad_prem * 0.50, 2)   # collected 50% decay
-                    pnl_rs  = round((strad_prem - exit_p) * LOT, 2)
+                    result = "WIN";  exit_p = round(strad_prem * 0.50, 2)
+                    pnl_rs = round((strad_prem - exit_p) * LOT, 2)
                 else:
-                    result  = "LOSS"
-                    exit_p  = round(strad_prem * 1.25, 2)   # expanded 25%
-                    pnl_rs  = round((strad_prem - exit_p) * LOT, 2)
+                    result = "LOSS"; exit_p = round(strad_prem * 1.25, 2)
+                    pnl_rs = round((strad_prem - exit_p) * LOT, 2)
 
                 capital += pnl_rs
                 results["straddle"]["trades"] += 1
@@ -1617,36 +1996,33 @@ def run_backtest(days: int = 60, from_date: str = None, to_date: str = None):
                 if result == "WIN": results["straddle"]["wins"] += 1
 
                 trade_log.append({
-                    "date":        date_str,
-                    "weekday":     ["Mon","Tue","Wed","Thu","Fri"][weekday],
-                    "strategy":    "Short Straddle",
-                    "mood":        "SIDEWAYS",
-                    "symbol":      strad_sym,
-                    "strike":      atm,
-                    "opt_type":    "STRADDLE",
-                    "expiry":      expiry_str,
-                    "spot_entry":  round(open_p, 2),
-                    "entry":       strad_prem,
-                    "sl":          round(strad_prem * (1 + STRADDLE_SL_PCT), 2),
-                    "tp":          round(strad_prem * (1 - STRADDLE_TP_PCT), 2),
-                    "exit":        exit_p,
-                    "entry_time":  "09:20",
-                    "exit_time":   "15:15",
-                    "result":      result,
-                    "pnl_rs":      round(pnl_rs, 0),
-                    "pnl_pct":     round((strad_prem - exit_p) / strad_prem * 100, 1),
-                    "capital":     round(capital, 0),
-                    "adx":         mood["adx"],
-                    "rsi":         mood["rsi"],
-                    "lots":        1,
-                    "ce_prem":     ce_prem,
-                    "pe_prem":     pe_prem,
-                    "move_pct":    round(move_pct * 100, 2),
+                    "date":       date_str,
+                    "weekday":    ["Mon","Tue","Wed","Thu","Fri"][weekday],
+                    "strategy":   "Short Straddle",
+                    "mood":       "SIDEWAYS",
+                    "symbol":     strad_sym,
+                    "strike":     atm,
+                    "opt_type":   "STRADDLE",
+                    "expiry":     expiry_str,
+                    "spot_entry": round(open_p, 2),
+                    "entry":      strad_prem,
+                    "sl":         round(strad_prem * 1.25, 2),
+                    "tp":         round(strad_prem * 0.50, 2),
+                    "exit":       exit_p,
+                    "entry_time": "09:20",
+                    "exit_time":  "15:15",
+                    "result":     result,
+                    "pnl_rs":     round(pnl_rs, 0),
+                    "pnl_pct":    round((strad_prem - exit_p) / strad_prem * 100, 1),
+                    "capital":    round(capital, 0),
+                    "adx":        round(float(row["ADX"]),1),
+                    "rsi":        round(float(row["RSI"]),1),
+                    "lots":       1,
+                    "move_pct":   round(move_pct * 100, 2),
                 })
 
         def wr(r):
-            t = r["trades"]
-            return round(r["wins"]/t*100, 1) if t else 0
+            return round(r["wins"] / r["trades"] * 100, 1) if r["trades"] else 0
 
         total_trades = results["directional"]["trades"] + results["straddle"]["trades"]
         total_wins   = results["directional"]["wins"]   + results["straddle"]["wins"]
@@ -1654,7 +2030,8 @@ def run_backtest(days: int = 60, from_date: str = None, to_date: str = None):
 
         summary = {
             "days":        len(dates),
-            "period":      f"{dates[0]} to {dates[-1]}",
+            "period":      f"{dates[0]} to {dates[-1]}" if dates else "",
+            "source":      "daily_bars",
             "directional": {**results["directional"], "win_rate": wr(results["directional"])},
             "straddle":    {**results["straddle"],    "win_rate": wr(results["straddle"])},
             "overall":     {"trades": total_trades, "wins": total_wins,
@@ -1669,6 +2046,193 @@ def run_backtest(days: int = 60, from_date: str = None, to_date: str = None):
         import traceback; traceback.print_exc()
         return {}
 
+
+def backtest_strategy(strategy_id: str, days: int = 365) -> dict:
+    """Run strategy backtest on daily bars — no Kite required."""
+    try:
+        log.info(f"📊 Strategy backtest: {strategy_id} ({days} days)")
+        df_raw = _fetch_daily(days)
+        if df_raw.empty or len(df_raw) < 15:
+            return {}
+        df_raw = _compute_daily_indicators(df_raw)
+        df_raw["date"] = df_raw.index.date
+        dates = sorted(df_raw["date"].unique())[-days:]
+
+        capital = 100000.0; trade_log = []
+        wins = losses = trades = 0; total_pnl = 0.0
+        LOT = LOT_SIZE
+
+        for i, d in enumerate(dates):
+            row = df_raw[df_raw["date"] == d]
+            if row.empty: continue
+            row      = row.iloc[0]
+            mood     = _daily_mood(row)
+            date_str = str(d)
+            weekday  = d.weekday()
+            if weekday > 4: continue  # skip weekends (yfinance sometimes includes them)
+            open_p   = float(row["Open"])
+            high_p   = float(row["High"])
+            low_p    = float(row["Low"])
+            close_p  = float(row["Close"])
+
+            result = None; pnl_rs = 0; prem_entry = 0; exit_p = 0
+
+            if strategy_id == "orb":
+                # On daily bars: ORB = first 30min range ≈ (H-L)*0.3
+                orb_range  = (high_p - low_p) * 0.3
+                entry_spot = open_p
+                prem_entry = _est_premium(entry_spot, dte=_dte(d))
+                tp_prem    = round(prem_entry * 1.80, 2)
+                sl_prem    = round(prem_entry * 0.60, 2)
+                # Breakout: if day moved > 0.5% from open
+                move = (close_p - open_p) / open_p
+                if abs(move) < 0.003: continue  # no clear breakout
+                direction = 1 if move > 0 else -1
+                hit_tp = high_p >= entry_spot * 1.012 if direction == 1 else low_p <= entry_spot * 0.988
+                hit_sl = low_p  <= entry_spot * 0.994 if direction == 1 else high_p >= entry_spot * 1.006
+                day_mv = (close_p - open_p) / open_p * direction
+                if hit_tp and hit_sl:
+                    if day_mv > 0:
+                        result = "WIN";  exit_p = tp_prem; pnl_rs = round((tp_prem - prem_entry) * LOT, 2)
+                    else:
+                        result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem - prem_entry) * LOT, 2)
+                elif hit_tp:
+                    result = "WIN";  exit_p = tp_prem; pnl_rs = round((tp_prem - prem_entry) * LOT, 2)
+                elif hit_sl:
+                    result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem - prem_entry) * LOT, 2)
+                else:
+                    exit_p = prem_entry * 0.95; pnl_rs = round((exit_p - prem_entry) * LOT, 2); result = "SQUAREOFF"
+
+            elif strategy_id in ("straddle_only", "expiry_straddle_only"):
+                if strategy_id == "expiry_straddle_only" and weekday != 1: continue
+                ce_real = _get_option_price(date_str, atm, "CE", expiry_str)
+                pe_real = _get_option_price(date_str, atm, "PE", expiry_str)
+                strad_prem = round((ce_real + pe_real), 2) if ce_real and pe_real else round(_est_premium(open_p, dte=_dte(d)) * 2, 2)
+                move_pct   = abs(close_p - open_p) / open_p
+                prem_entry = strad_prem
+                if move_pct < 0.015:
+                    result = "WIN";  pnl_rs = round(strad_prem * 0.5 * LOT, 2);  exit_p = round(strad_prem*0.5,2)
+                else:
+                    result = "LOSS"; pnl_rs = round(-strad_prem * 0.3 * LOT, 2); exit_p = round(strad_prem*1.3,2)
+
+            elif strategy_id in ("directional_only", "strict_directional"):
+                if mood not in ("TRENDING_UP","TRENDING_DOWN"): continue
+                direction  = 1 if mood == "TRENDING_UP" else -1
+                min_sc     = 4 if strategy_id == "strict_directional" else 3
+                # Quick score on this bar
+                sc = sum([
+                    float(row["EMA9"]) > float(row["EMA21"]) if direction==1 else float(row["EMA9"]) < float(row["EMA21"]),
+                    float(row["EMA21"]) > float(row["EMA50"]) if direction==1 else float(row["EMA21"]) < float(row["EMA50"]),
+                    float(row["Close"]) > float(row["VWAP"]) if direction==1 else float(row["Close"]) < float(row["VWAP"]),
+                    int(row["ST_trend"]) == direction,
+                    float(row["RSI"]) > 50 if direction==1 else float(row["RSI"]) < 50,
+                ])
+                if sc < min_sc: continue
+                entry_spot = open_p; prem_entry = _est_premium(entry_spot, dte=_dte(d))
+                tp_prem = round(prem_entry * (1+OPTION_TP_PCT), 2)
+                sl_prem = round(prem_entry * (1-OPTION_SL_PCT), 2)
+                hit_tp = high_p >= entry_spot * 1.018 if direction==1 else low_p  <= entry_spot * 0.982
+                hit_sl = low_p  <= entry_spot * 0.992 if direction==1 else high_p >= entry_spot * 1.008
+                day_mv = (close_p - open_p) / open_p * direction
+                if hit_tp and hit_sl:
+                    if day_mv > 0:
+                        result = "WIN";  exit_p = tp_prem; pnl_rs = round((tp_prem-prem_entry)*LOT,2)
+                    else:
+                        result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem-prem_entry)*LOT,2)
+                elif hit_tp:
+                    result = "WIN";  exit_p = tp_prem; pnl_rs = round((tp_prem-prem_entry)*LOT,2)
+                elif hit_sl:
+                    result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem-prem_entry)*LOT,2)
+                else:
+                    dir_mv3=(close_p-open_p)/open_p*direction
+                    opt_mv3=max(-0.60,min(0.80,dir_mv3*5.0))
+                    exit_p=round(prem_entry*(1+opt_mv3),2); pnl_rs=round((exit_p-prem_entry)*LOT,2)
+                    result="WIN" if opt_mv3>0 else "SQUAREOFF"
+
+            elif strategy_id == "our_combined":
+                if mood in ("TRENDING_UP","TRENDING_DOWN"):
+                    direction = 1 if mood=="TRENDING_UP" else -1
+                    entry_spot = open_p; prem_entry = _est_premium(entry_spot, dte=_dte(d))
+                    tp_prem = round(prem_entry*(1+OPTION_TP_PCT),2)
+                    sl_prem = round(prem_entry*(1-OPTION_SL_PCT),2)
+                    hit_tp = high_p>=entry_spot*1.018 if direction==1 else low_p<=entry_spot*0.982
+                    hit_sl = low_p<=entry_spot*0.992  if direction==1 else high_p>=entry_spot*1.008
+                    day_mv = (close_p-open_p)/open_p*direction
+                    if hit_tp and hit_sl:
+                        if day_mv>0: result="WIN"; exit_p=tp_prem; pnl_rs=round((tp_prem-prem_entry)*LOT,2)
+                        else:        result="LOSS"; exit_p=sl_prem; pnl_rs=round((sl_prem-prem_entry)*LOT,2)
+                    elif hit_tp:
+                        result="WIN"; exit_p=tp_prem; pnl_rs=round((tp_prem-prem_entry)*LOT,2)
+                    elif hit_sl:
+                        result="LOSS"; exit_p=sl_prem; pnl_rs=round((sl_prem-prem_entry)*LOT,2)
+                    else:
+                        dir_mv2=(close_p-open_p)/open_p*(1 if mood=="TRENDING_UP" else -1)
+                        opt_mv2=max(-0.60,min(0.80,dir_mv2*5.0))
+                        exit_p=round(prem_entry*(1+opt_mv2),2); pnl_rs=round((exit_p-prem_entry)*LOT,2)
+                        result="WIN" if opt_mv2>0 else "SQUAREOFF"
+                elif mood=="SIDEWAYS":
+                    prem_entry = round(open_p*0.02,2); move_pct=abs(close_p-open_p)/open_p
+                    if move_pct<0.015:
+                        result="WIN";  pnl_rs=round(prem_entry*0.5*LOT,2);  exit_p=round(prem_entry*0.5,2)
+                    else:
+                        result="LOSS"; pnl_rs=round(-prem_entry*0.3*LOT,2); exit_p=round(prem_entry*1.3,2)
+                else: continue
+            else:
+                continue
+
+            if result is None: continue
+            capital += pnl_rs; total_pnl += pnl_rs; trades += 1
+            if result=="WIN": wins+=1
+            elif result=="LOSS": losses+=1
+            trade_log.append({
+                "date": date_str,
+                "strategy": STRATEGIES.get(strategy_id,{}).get("name", strategy_id),
+                "mood": mood, "entry": prem_entry, "exit": exit_p,
+                "result": result, "pnl_rs": round(pnl_rs,0),
+                "capital": round(capital,0),
+            })
+
+        wr = round(wins/trades*100,1) if trades else 0
+
+        # Max drawdown
+        capitals    = [100000.0] + [t["capital"] for t in trade_log]
+        peak        = capitals[0]; max_dd = 0
+        for cap in capitals:
+            if cap > peak: peak = cap
+            dd = (peak - cap) / peak * 100
+            if dd > max_dd: max_dd = dd
+
+        # Profit factor = gross wins / gross losses
+        gross_win  = sum(t["pnl_rs"] for t in trade_log if t["pnl_rs"] > 0)
+        gross_loss = abs(sum(t["pnl_rs"] for t in trade_log if t["pnl_rs"] < 0))
+        profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else 999
+
+        # Sharpe ratio (simplified — daily returns)
+        if len(trade_log) > 1:
+            import numpy as np
+            rets = [t["pnl_rs"] / 100000 for t in trade_log]
+            sharpe = round(np.mean(rets) / (np.std(rets) + 1e-9) * (252**0.5), 2)
+        else:
+            sharpe = 0
+
+        return {
+            "strategy_id":    strategy_id,
+            "strategy_name":  STRATEGIES.get(strategy_id,{}).get("name", strategy_id),
+            "strategy_color": STRATEGIES.get(strategy_id,{}).get("color","#fff"),
+            "days":           len(dates),
+            "period":         f"{dates[0]} to {dates[-1]}" if dates else "",
+            "trades":         trades, "wins": wins, "losses": losses,
+            "win_rate":       wr, "total_pnl": round(total_pnl,0),
+            "final_capital":  round(capital,0),
+            "max_drawdown":   round(max_dd, 1),
+            "profit_factor":  profit_factor,
+            "sharpe":         sharpe,
+            "trade_log":      list(reversed(trade_log)),
+        }
+    except Exception as e:
+        log.error(f"Strategy backtest error ({strategy_id}): {e}")
+        import traceback; traceback.print_exc()
+        return {}
 
 # ─── STRATEGY COMPARISON ENGINE ───────────────────────────────────────────────
 
@@ -1704,214 +2268,6 @@ STRATEGIES = {
         "color": "#fb7185",
     },
 }
-
-def backtest_strategy(strategy_id: str, days: int = 30) -> dict:
-    """Run backtest for a specific strategy."""
-    if not _kite_active():
-        return {}
-    try:
-        log.info(f"📊 Strategy backtest: {strategy_id} ({days} days)")
-        df_raw = kite_history_multi(days + 5)
-        if df_raw.empty or len(df_raw) < 20:
-            return {}
-        df_raw["date"] = df_raw.index.date
-        dates = sorted(df_raw["date"].unique())[-days:]
-
-        capital   = 100000.0
-        trade_log = []
-        wins = losses = trades = 0
-        total_pnl = 0.0
-        LOT = LOT_SIZE
-
-        for d in dates:
-            day = df_raw[df_raw["date"] == d].copy()
-            if len(day) < 15: continue
-            day  = compute_indicators(day)
-            mood = detect_mood(day)
-            date_str = str(d)
-            weekday  = d.weekday()  # 0=Mon, 1=Tue
-
-            # ── ORB Strategy ──────────────────────────────────────────────
-            if strategy_id == "orb":
-                # First 3 bars = 9:15-9:30 opening range
-                if len(day) < 6: continue
-                orb_high = float(day.iloc[:3]["High"].max())
-                orb_low  = float(day.iloc[:3]["Low"].min())
-                orb_range = orb_high - orb_low
-                rest = day.iloc[3:]
-                if rest.empty or orb_range < 20: continue  # skip tiny range days
-
-                direction = None
-                entry_spot = None
-                for _, bar in rest.iterrows():
-                    if float(bar["High"]) > orb_high:
-                        direction = 1; entry_spot = orb_high; break
-                    elif float(bar["Low"]) < orb_low:
-                        direction = -1; entry_spot = orb_low; break
-
-                if direction is None: continue
-
-                opt_type   = "CE" if direction == 1 else "PE"
-                prem_entry = round(entry_spot * 0.012, 2)
-                sl_spot    = entry_spot - (orb_range * 0.5 * direction)
-                tp_spot    = entry_spot + (orb_range * 1.0 * direction)
-
-                idx = list(rest.index).index(rest.index[0]) if entry_spot else 0
-                post_entry = rest
-                if direction == 1:
-                    hit_tp = any(float(r["High"]) >= tp_spot for _, r in post_entry.iterrows())
-                    hit_sl = any(float(r["Low"])  <= sl_spot for _, r in post_entry.iterrows())
-                else:
-                    hit_tp = any(float(r["Low"])  <= tp_spot for _, r in post_entry.iterrows())
-                    hit_sl = any(float(r["High"]) >= sl_spot for _, r in post_entry.iterrows())
-
-                tp_prem = round(prem_entry * 1.80, 2)
-                sl_prem = round(prem_entry * 0.60, 2)
-
-                if hit_tp and not hit_sl:
-                    result = "WIN"; exit_p = tp_prem; pnl_rs = round((tp_prem - prem_entry) * LOT, 2)
-                elif hit_sl:
-                    result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem - prem_entry) * LOT, 2)
-                else:
-                    exit_p = prem_entry * 0.95; pnl_rs = round((exit_p - prem_entry) * LOT, 2)
-                    result = "SQUAREOFF"
-
-            # ── Straddle Only ─────────────────────────────────────────────
-            elif strategy_id in ("straddle_only", "expiry_straddle_only"):
-                if strategy_id == "expiry_straddle_only" and weekday != 1:
-                    continue  # only Tuesdays
-                open_p  = float(day["Close"].iloc[0])
-                close_p = float(day["Close"].iloc[-1])
-                move_pct = abs(close_p - open_p) / open_p
-                strad_prem = round(open_p * 0.02, 2)
-                if move_pct < 0.015:
-                    result = "WIN";  pnl_rs = round(strad_prem * 0.5 * LOT, 2)
-                else:
-                    result = "LOSS"; pnl_rs = round(-strad_prem * 0.3 * LOT, 2)
-                exit_p = 0; prem_entry = strad_prem
-
-            # ── Directional Only ──────────────────────────────────────────
-            elif strategy_id in ("directional_only", "strict_directional"):
-                if mood["regime"] not in ("TRENDING_UP", "TRENDING_DOWN"):
-                    continue
-                min_sc = 4 if strategy_id == "strict_directional" else 3
-                bar_idx = min(4, len(day)-3)
-                bar     = day.iloc[bar_idx]
-                rest    = day.iloc[bar_idx+1:]
-                if rest.empty: continue
-
-                direction  = 1 if mood["regime"] == "TRENDING_UP" else -1
-                opt_type   = "CE" if direction == 1 else "PE"
-                entry_spot = float(bar["Close"])
-                prem_entry = round(entry_spot * 0.015, 2)
-
-                # score check
-                row = bar
-                sc = 0
-                if direction == 1:
-                    if float(row["EMA9"]) > float(row["EMA21"]): sc += 1
-                    if float(row["EMA21"]) > float(row["EMA50"]): sc += 1
-                    if float(row["Close"]) > float(row["VWAP"]): sc += 1
-                    if int(row["ST_trend"]) == 1: sc += 1
-                    if float(row["RSI"]) > 50: sc += 1
-                else:
-                    if float(row["EMA9"]) < float(row["EMA21"]): sc += 1
-                    if float(row["EMA21"]) < float(row["EMA50"]): sc += 1
-                    if float(row["Close"]) < float(row["VWAP"]): sc += 1
-                    if int(row["ST_trend"]) == -1: sc += 1
-                    if float(row["RSI"]) < 50: sc += 1
-                if sc < min_sc: continue
-
-                if direction == 1:
-                    hit_tp = any(float(r["High"]) >= entry_spot * 1.010 for _, r in rest.iterrows())
-                    hit_sl = any(float(r["Low"])  <= entry_spot * 0.993 for _, r in rest.iterrows())
-                else:
-                    hit_tp = any(float(r["Low"])  <= entry_spot * 0.990 for _, r in rest.iterrows())
-                    hit_sl = any(float(r["High"]) >= entry_spot * 1.007 for _, r in rest.iterrows())
-
-                tp_prem = round(prem_entry * (1 + OPTION_TP_PCT), 2)
-                sl_prem = round(prem_entry * (1 - OPTION_SL_PCT), 2)
-                if hit_tp and not hit_sl:
-                    result = "WIN";  exit_p = tp_prem; pnl_rs = round((tp_prem - prem_entry) * LOT, 2)
-                elif hit_sl:
-                    result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem - prem_entry) * LOT, 2)
-                else:
-                    exit_p = round(float(rest.iloc[-1]["Close"]) * 0.010, 2)
-                    pnl_rs = round((exit_p - prem_entry) * LOT, 2); result = "SQUAREOFF"
-
-            # ── Our Combined (same as run_backtest) ───────────────────────
-            elif strategy_id == "our_combined":
-                if mood["regime"] in ("TRENDING_UP", "TRENDING_DOWN"):
-                    bar_idx = min(4, len(day)-3)
-                    bar = day.iloc[bar_idx]; rest = day.iloc[bar_idx+1:]
-                    if rest.empty: continue
-                    direction  = 1 if mood["regime"] == "TRENDING_UP" else -1
-                    opt_type   = "CE" if direction == 1 else "PE"
-                    entry_spot = float(bar["Close"])
-                    prem_entry = round(entry_spot * 0.015, 2)
-                    if direction == 1:
-                        hit_tp = any(float(r["High"]) >= entry_spot * 1.010 for _, r in rest.iterrows())
-                        hit_sl = any(float(r["Low"])  <= entry_spot * 0.993 for _, r in rest.iterrows())
-                    else:
-                        hit_tp = any(float(r["Low"])  <= entry_spot * 0.990 for _, r in rest.iterrows())
-                        hit_sl = any(float(r["High"]) >= entry_spot * 1.007 for _, r in rest.iterrows())
-                    tp_prem = round(prem_entry * (1 + OPTION_TP_PCT), 2)
-                    sl_prem = round(prem_entry * (1 - OPTION_SL_PCT), 2)
-                    if hit_tp and not hit_sl:
-                        result = "WIN"; exit_p = tp_prem; pnl_rs = round((tp_prem - prem_entry) * LOT, 2)
-                    elif hit_sl:
-                        result = "LOSS"; exit_p = sl_prem; pnl_rs = round((sl_prem - prem_entry) * LOT, 2)
-                    else:
-                        exit_p = round(float(rest.iloc[-1]["Close"]) * 0.010, 2)
-                        pnl_rs = round((exit_p - prem_entry) * LOT, 2); result = "SQUAREOFF"
-                    prem_entry = prem_entry
-                elif mood["regime"] == "SIDEWAYS":
-                    open_p  = float(day["Close"].iloc[0])
-                    close_p = float(day["Close"].iloc[-1])
-                    move_pct = abs(close_p - open_p) / open_p
-                    prem_entry = round(open_p * 0.02, 2); exit_p = 0
-                    if move_pct < 0.015:
-                        result = "WIN";  pnl_rs = round(prem_entry * 0.5 * LOT, 2)
-                    else:
-                        result = "LOSS"; pnl_rs = round(-prem_entry * 0.3 * LOT, 2)
-                    opt_type = "STRADDLE"
-                else:
-                    continue
-            else:
-                continue
-
-            capital   += pnl_rs
-            total_pnl += pnl_rs
-            trades    += 1
-            if result == "WIN":  wins  += 1
-            elif result == "LOSS": losses += 1
-
-            trade_log.append({
-                "date": date_str, "strategy": STRATEGIES.get(strategy_id, {}).get("name", strategy_id),
-                "mood": mood["regime"], "entry": prem_entry, "exit": exit_p,
-                "result": result, "pnl_rs": round(pnl_rs, 0),
-                "capital": round(capital, 0),
-            })
-
-        wr = round(wins / trades * 100, 1) if trades else 0
-        return {
-            "strategy_id":   strategy_id,
-            "strategy_name": STRATEGIES.get(strategy_id, {}).get("name", strategy_id),
-            "strategy_color": STRATEGIES.get(strategy_id, {}).get("color", "#fff"),
-            "days":          len(dates),
-            "period":        f"{dates[0]} to {dates[-1]}" if dates else "",
-            "trades":        trades,
-            "wins":          wins,
-            "losses":        losses,
-            "win_rate":      wr,
-            "total_pnl":     round(total_pnl, 0),
-            "final_capital": round(capital, 0),
-            "trade_log":     list(reversed(trade_log)),
-        }
-    except Exception as e:
-        log.error(f"Strategy backtest error ({strategy_id}): {e}")
-        import traceback; traceback.print_exc()
-        return {}
 
 def compare_strategies(strategy_ids: list, days: int = 30) -> dict:
     """Run multiple strategies and return comparison."""
@@ -2423,6 +2779,159 @@ window.addEventListener('resize', () => {
 </html>"""
 
 
+HISTORY_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trade History · Nifty Scanner v5</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#07090c;--surf:#0d1117;--surf2:#141922;--border:#1a2030;
+  --green:#00d4aa;--red:#ff4060;--gold:#f5c518;--blue:#4fa3f5;
+  --text:#d8e0ec;--muted:#4a5568;--radius:8px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;font-size:14px}
+.wrap{max-width:1200px;margin:0 auto;padding:0 24px 60px}
+.nav{display:flex;align-items:center;justify-content:space-between;padding:18px 0 16px;
+  border-bottom:1px solid var(--border);margin-bottom:28px;flex-wrap:wrap;gap:12px}
+.nav-brand{font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:.05em;color:#fff}
+.nav-brand span{color:var(--green)}
+.nav-links{display:flex;gap:8px}
+.nav-link{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  padding:6px 16px;border-radius:4px;border:1px solid var(--border);color:var(--muted);
+  text-decoration:none;transition:.15s}
+.nav-link:hover,.nav-link.active{color:var(--text);border-color:#444}
+.nav-link.active{background:var(--surf2)}
+.page-title{font-family:'Bebas Neue',sans-serif;font-size:48px;
+  background:linear-gradient(135deg,#fff,var(--green));-webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;background-clip:text;margin-bottom:6px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;align-items:center}
+.filter-btn{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+  padding:6px 14px;border-radius:4px;border:1px solid var(--border);background:transparent;
+  color:var(--muted);cursor:pointer;transition:.15s}
+.filter-btn:hover{color:var(--text);border-color:#444}
+.filter-btn.active{background:var(--surf2);color:var(--text);border-color:#555}
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+@media(max-width:600px){.stats-row{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--surf);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+.stat-val{font-family:'Bebas Neue',sans-serif;font-size:28px}
+.stat-lbl{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-top:3px}
+.table-wrap{background:var(--surf);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.th-row{display:grid;grid-template-columns:95px 70px 140px 155px 80px 80px 90px 80px;gap:8px;
+  padding:10px 14px;font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);
+  letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--surf2)}
+.td-row{display:grid;grid-template-columns:95px 70px 140px 155px 80px 80px 90px 80px;gap:8px;
+  padding:9px 14px;font-family:'DM Mono',monospace;font-size:11px;
+  border-bottom:1px solid rgba(26,32,48,.5);border-left:3px solid transparent}
+.td-row:hover{background:var(--surf2)}
+.td-row.win{border-left-color:var(--green);background:rgba(0,212,170,.02)}
+.td-row.loss{border-left-color:var(--red);background:rgba(255,64,96,.02)}
+.loading{padding:40px;text-align:center;color:var(--muted);font-family:'DM Mono',monospace;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="nav">
+    <div class="nav-brand">NIFTY SCANNER <span>v5</span></div>
+    <div class="nav-links">
+      <a href="/" class="nav-link">Dashboard</a>
+      <a href="/strategies" class="nav-link">Strategy Lab</a>
+      <a href="/history" class="nav-link active">History</a>
+    </div>
+  </div>
+  <div class="page-title">Trade History</div>
+  <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);margin-bottom:20px">All paper trades from database</div>
+
+  <div class="filters">
+    <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase">Period:</span>
+    <button class="filter-btn" onclick="setDays(7)">7D</button>
+    <button class="filter-btn active" onclick="setDays(30)" id="f-30">30D</button>
+    <button class="filter-btn" onclick="setDays(90)">90D</button>
+    <button class="filter-btn" onclick="setDays(999)">All</button>
+    <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-left:12px">Result:</span>
+    <button class="filter-btn active" onclick="setResult('')" id="r-all">All</button>
+    <button class="filter-btn" onclick="setResult('WIN')">Wins</button>
+    <button class="filter-btn" onclick="setResult('LOSS')">Losses</button>
+    <button class="filter-btn" onclick="setResult('SQUAREOFF')">Squareoff</button>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat"><div class="stat-val" id="h-total">--</div><div class="stat-lbl">Total Trades</div></div>
+    <div class="stat"><div class="stat-val" id="h-wr" style="color:var(--muted)">--%</div><div class="stat-lbl">Win Rate</div></div>
+    <div class="stat"><div class="stat-val" id="h-pnl" style="color:var(--muted)">₹--</div><div class="stat-lbl">Total P&L</div></div>
+    <div class="stat"><div class="stat-val" id="h-wins">--</div><div class="stat-lbl">Wins / Losses</div></div>
+  </div>
+
+  <div class="table-wrap">
+    <div class="th-row"><span>Date</span><span>Time</span><span>Direction</span><span>Symbol</span><span>Entry ₹</span><span>Exit ₹</span><span>P&L ₹</span><span>Result</span></div>
+    <div id="trade-body"><div class="loading">Loading…</div></div>
+  </div>
+</div>
+<script>
+let cDays=30, cResult='';
+function setDays(d){
+  cDays=d;
+  document.querySelectorAll('.filter-btn').forEach(b=>{
+    const labels={'7':'7D','30':'30D','90':'90D','999':'All'};
+    if(Object.values(labels).includes(b.textContent))
+      b.className='filter-btn'+(b.textContent===labels[String(d)]?' active':'');
+  });
+  load();
+}
+function setResult(r){
+  cResult=r;
+  document.querySelectorAll('.filter-btn').forEach(b=>{
+    const map={'':'All','WIN':'Wins','LOSS':'Losses','SQUAREOFF':'Squareoff'};
+    if(Object.values(map).includes(b.textContent))
+      b.className='filter-btn'+(b.textContent===map[r]?' active':'');
+  });
+  load();
+}
+function fmt(n,d=2){return Number(n).toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d})}
+async function load(){
+  document.getElementById('trade-body').innerHTML='<div class="loading">Loading…</div>';
+  try{
+    const res=await fetch(`/api/paper/history?days=${cDays}&result=${cResult}`);
+    const d=await res.json();
+    const trades=d.trades||[];
+    const wins=trades.filter(t=>t.result==='WIN').length;
+    const losses=trades.filter(t=>t.result==='LOSS').length;
+    const total=trades.length;
+    const wr=total?Math.round(wins/total*100):0;
+    const pnl=trades.reduce((s,t)=>s+(t.pnl_rs||0),0);
+    document.getElementById('h-total').textContent=total;
+    const wrEl=document.getElementById('h-wr');
+    wrEl.textContent=wr+'%'; wrEl.style.color=wr>=55?'var(--green)':wr>=40?'var(--gold)':'var(--red)';
+    const pEl=document.getElementById('h-pnl');
+    pEl.textContent=(pnl>=0?'+':'')+'₹'+fmt(Math.abs(pnl),0); pEl.style.color=pnl>=0?'var(--green)':'var(--red)';
+    document.getElementById('h-wins').textContent=wins+'W / '+losses+'L';
+    const body=document.getElementById('trade-body');
+    if(!trades.length){body.innerHTML='<div class="loading">No trades found</div>';return;}
+    body.innerHTML=trades.map(t=>{
+      const cls=t.result==='WIN'?'win':t.result==='LOSS'?'loss':'';
+      const icon=t.result==='WIN'?'✅':t.result==='LOSS'?'❌':'⏱';
+      const p=t.pnl_rs||0;
+      const pc=p>=0?'color:var(--green)':'color:var(--red)';
+      const dc=t.direction?.includes('CE')?'color:var(--green)':'color:var(--red)';
+      return `<div class="td-row ${cls}">
+        <span style="color:var(--muted)">${(t.entry_time||'--').slice(0,10)}</span>
+        <span style="color:var(--muted)">${(t.entry_time||'--').slice(11,19)||t.entry_time||'--'}</span>
+        <span style="${dc}">${t.direction||'--'}</span>
+        <span style="font-size:9px;color:var(--blue)">${(t.symbol||'--').replace('NFO:','')}</span>
+        <span>₹${fmt(t.entry_ltp||0)}</span>
+        <span>₹${fmt(t.exit_ltp||0)}</span>
+        <span style="${pc}">${icon} ${p>=0?'+':''}₹${fmt(Math.abs(p),0)}</span>
+        <span style="${pc}">${t.result||'--'}</span>
+      </div>`;
+    }).join('');
+  }catch(e){document.getElementById('trade-body').innerHTML='<div class="loading">Error loading trades</div>';}
+}
+load();
+</script>
+</body>
+</html>"""
+
 # ─── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
@@ -2629,6 +3138,9 @@ canvas#sparkline{width:100%;height:70px;opacity:.8}
       <a href="/strategies" style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
         padding:5px 14px;border-radius:4px;border:1px solid var(--border);color:var(--muted);
         background:var(--surf2);text-decoration:none">⚗️ Strategy Lab</a>
+      <a href="/history" style="font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+        padding:5px 14px;border-radius:4px;border:1px solid var(--border);color:var(--muted);
+        background:var(--surf2);text-decoration:none">📋 History</a>
       <div id="kite-badge" class="badge badge-muted" onclick="checkKite()">⬤ Kite: Checking…</div>
       <div id="mkt-badge" class="badge badge-muted">⬤ Market</div>
       <div style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">
@@ -2796,27 +3308,31 @@ canvas#sparkline{width:100%;height:70px;opacity:.8}
   <!-- BACKTEST PANEL -->
   <div class="card" style="margin-bottom:16px">
     <div class="card-head">
-      <span class="card-title">Interactive Backtest</span>
+      <span class="card-title">Interactive Backtest <span style="font-size:9px;color:var(--muted);font-weight:normal">(Daily bars · yfinance · Years of data)</span></span>
       <div id="bt-running" style="font-family:'DM Mono',monospace;font-size:10px;color:var(--gold);display:none">⏳ Running…</div>
     </div>
-    <!-- Quick buttons + date range in one row -->
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px;padding:0 2px">
+    <!-- Row 1: Quick buttons -->
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
       <button class="trade-btn btn-close" id="bt-btn-1d"   onclick="runBacktestDays(1)">Yesterday</button>
       <button class="trade-btn btn-close" id="bt-btn-7d"   onclick="runBacktestDays(7)">Last Week</button>
       <button class="trade-btn btn-close" id="bt-btn-30d"  onclick="runBacktestDays(30)">Last Month</button>
       <button class="trade-btn btn-close" id="bt-btn-60d"  onclick="runBacktestDays(60)">60 Days</button>
       <button class="trade-btn btn-close" id="bt-btn-120d" onclick="runBacktestDays(120)">120 Days</button>
-      <button class="trade-btn btn-close" id="bt-btn-400d" onclick="runBacktestDays(400)">Max (400D)</button>
-      <div style="width:1px;height:20px;background:var(--border);margin:0 4px"></div>
-      <!-- Date range picker -->
-      <div style="display:flex;align-items:center;gap:6px">
-        <input type="date" id="bt-from" style="font-family:'DM Mono',monospace;font-size:10px;padding:5px 8px;
-          border-radius:4px;border:1px solid var(--border);background:var(--surf2);color:#e0e0e0;cursor:pointer">
-        <span style="font-size:10px;color:var(--muted)">to</span>
-        <input type="date" id="bt-to" style="font-family:'DM Mono',monospace;font-size:10px;padding:5px 8px;
-          border-radius:4px;border:1px solid var(--border);background:var(--surf2);color:#e0e0e0;cursor:pointer">
-        <button class="trade-btn btn-ce" onclick="runBacktestRange()" style="padding:5px 12px;font-size:10px">▶ Run</button>
-      </div>
+      <button class="trade-btn btn-close" id="bt-btn-365d" onclick="runBacktestDays(365)">1 Year</button>
+      <button class="trade-btn btn-close" id="bt-btn-730d" onclick="runBacktestDays(730)">2 Years</button>
+      <button class="trade-btn btn-close" id="bt-btn-1825d" onclick="runBacktestDays(1825)">5 Years</button>
+    </div>
+    <!-- Row 2: Custom date range — always fully visible -->
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;
+      padding:10px 14px;background:var(--surf2);border:1px solid var(--border);border-radius:6px">
+      <span style="font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);
+        letter-spacing:.1em;text-transform:uppercase">Custom Range:</span>
+      <input type="date" id="bt-from" style="font-family:'DM Mono',monospace;font-size:11px;padding:6px 10px;
+        border-radius:4px;border:1px solid var(--border);background:var(--bg);color:#e0e0e0;cursor:pointer">
+      <span style="font-size:12px;color:var(--muted)">→</span>
+      <input type="date" id="bt-to" style="font-family:'DM Mono',monospace;font-size:11px;padding:6px 10px;
+        border-radius:4px;border:1px solid var(--border);background:var(--bg);color:#e0e0e0;cursor:pointer">
+      <button class="trade-btn btn-ce" onclick="runBacktestRange()" style="padding:6px 16px;font-size:10px">▶ Run Range</button>
     </div>
 
     <!-- Summary stats -->
@@ -2933,7 +3449,7 @@ canvas#sparkline{width:100%;height:70px;opacity:.8}
 })();
 
 function _clearBtButtons(){
-  ['1d','7d','30d','60d','120d','400d'].forEach(id=>{
+  ['1d','7d','30d','60d','120d','365d','730d','1825d'].forEach(id=>{
     const b=document.getElementById('bt-btn-'+id);
     if(b) b.className='trade-btn btn-close';
   });
@@ -2959,29 +3475,76 @@ function runBacktestRange(){
   if(!from||!to){alert('Select both start and end date');return;}
   if(from>to){alert('Start date must be before end date');return;}
   const days=Math.ceil((new Date(to)-new Date(from))/86400000)+1;
-  if(days>400){alert('Max range is 400 days (Kite API limit)');return;}
+  if(days>3650){alert('Max range is 10 years');return;}
   _runBacktest({from_date:from, to_date:to, days});
 }
 
+let _currentRunId = null;
+
 async function _runBacktest(params){
-  document.getElementById('bt-running').style.display='block';
+  // Cancel any previous poll immediately
+  if(_btPolling){ clearInterval(_btPolling); _btPolling=null; }
+  _currentRunId = null;
+
   const label=params.from_date ? `${params.from_date} → ${params.to_date}` : `${params.days} days`;
+  document.getElementById('bt-running').style.display='block';
   document.getElementById('bt-trade-log').innerHTML=
     `<div style="padding:20px;text-align:center;color:var(--muted);font-family:monospace;font-size:11px">⏳ Fetching ${label} of data…</div>`;
-  await fetch('/api/backtest/run',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(params)});
-  if(_btPolling) clearInterval(_btPolling);
+
+  // Reset summary stats
+  ['bt-total-trades','bt-overall-wr','bt-total-pnl','bt-dir-wr2','bt-str-wr2'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.textContent='…';
+  });
+  document.getElementById('bt-period').textContent=`Loading ${label}…`;
+  document.getElementById('bt-capital-end').textContent='Final Capital: …';
+
+  // Fire request — server returns a run_id
+  let runId = null;
+  try{
+    const res = await fetch('/api/backtest/run',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(params)});
+    const meta = await res.json();
+    runId = meta.run_id || null;
+    _currentRunId = runId;
+  }catch(e){
+    console.warn('Failed to start backtest:', e);
+    document.getElementById('bt-running').style.display='none';
+    return;
+  }
+
   let attempts=0;
   _btPolling=setInterval(async()=>{
     attempts++;
-    const res=await fetch('/api/backtest');
-    const d=await res.json();
-    if(d.overall||attempts>60){
-      clearInterval(_btPolling);
-      document.getElementById('bt-running').style.display='none';
-      renderBacktestPanel(d);
-      fetchBacktest();
-    }
+    // If another run started after us, abort this poll
+    if(_currentRunId !== runId){ clearInterval(_btPolling); _btPolling=null; return; }
+    try{
+      const res=await fetch('/api/backtest');
+      const d=await res.json();
+      // Accept result only if: has overall, not _running, and run_id matches
+      const isReady = d.overall && !d._running && (
+        !runId ||           // no runId (shouldn't happen)
+        !d._run_id ||       // server result has no run_id tag (old result)
+        d._run_id === runId // exact match
+      );
+      if(isReady){
+        clearInterval(_btPolling); _btPolling=null;
+        document.getElementById('bt-running').style.display='none';
+        renderBacktestPanel(d);
+        if(d.directional){
+          document.getElementById('bt-dir-wr').textContent=(d.directional.win_rate||0)+'%';
+          document.getElementById('bt-dir-trades').textContent=(d.directional.trades||0)+' trades · '+(d.days||'--')+' days';
+        }
+        if(d.straddle){
+          document.getElementById('bt-str-wr').textContent=(d.straddle.win_rate||0)+'%';
+          document.getElementById('bt-str-trades').textContent=(d.straddle.trades||0)+' trades';
+        }
+      } else if(attempts>90){
+        clearInterval(_btPolling); _btPolling=null;
+        document.getElementById('bt-running').style.display='none';
+        document.getElementById('bt-trade-log').innerHTML=
+          '<div style="padding:20px;text-align:center;color:var(--red);font-family:monospace;font-size:11px">⚠️ Backtest timed out — check yfinance or Kite connection</div>';
+      }
+    }catch(e){ console.warn('Backtest poll error:', e); }
   },2000);
 }
 
@@ -3304,6 +3867,7 @@ async function fetchBacktest(){
   try{
     const res = await fetch('/api/backtest');
     const d   = await res.json();
+    window._lastBtData = d;
     if(d.directional){
       setText('bt-dir-wr',    (d.directional.win_rate||0)+'%');
       setText('bt-dir-trades',(d.directional.trades||0)+' trades · '+(d.days||'--')+' days');
@@ -3312,8 +3876,9 @@ async function fetchBacktest(){
       setText('bt-str-wr',    (d.straddle.win_rate||0)+'%');
       setText('bt-str-trades',(d.straddle.trades||0)+' trades');
     }
-    renderBacktestPanel(d);
-  }catch(e){}
+    if(d.overall) renderBacktestPanel(d);
+    return d;
+  }catch(e){ return {}; }
 }
 
 let _btPolling = null;
@@ -3428,8 +3993,12 @@ async function fetchCandles(){
 checkKite();
 fetchState();
 fetchPaper();
-fetchBacktest();
 fetchCandles();
+// On load: fetch existing result, if empty auto-run 30d
+fetchBacktest().then(()=>{
+  const bt = window._lastBtData;
+  if(!bt || !bt.overall) runBacktestDays(365);
+});
 
 // Backtest period buttons
 document.querySelectorAll('[data-days]').forEach(btn => {
@@ -3492,18 +4061,34 @@ def api_backtest_run():
     """Run backtest for a specific period — accepts days OR from_date+to_date."""
     body      = request.get_json() or {}
     days      = int(body.get("days", 30))
-    from_date = body.get("from_date")   # "YYYY-MM-DD"
-    to_date   = body.get("to_date")     # "YYYY-MM-DD"
+    from_date = body.get("from_date")
+    to_date   = body.get("to_date")
+    days = min(max(days, 1), 730)
 
-    # Clamp days to 400 (Kite API limit)
-    days = min(max(days, 1), 400)
+    import uuid
+    run_id = str(uuid.uuid4())[:8]
 
-    def _run():
-        bt = run_backtest(days, from_date=from_date, to_date=to_date)
+    # Clear previous result — include run_id so JS knows when fresh result arrives
+    with state_lock:
+        state["backtest"] = {"_running": True, "_run_id": run_id}
+
+    def _run(rid=run_id):
+        print(f"[BT] Thread started rid={rid} days={days}", flush=True)
+        try:
+            bt = run_backtest(days, from_date=from_date, to_date=to_date)
+            print(f"[BT] run_backtest returned: {type(bt)} keys={list(bt.keys()) if isinstance(bt,dict) else 'N/A'}", flush=True)
+            if not isinstance(bt, dict):
+                bt = {"error": "Backtest returned invalid result"}
+            bt["_run_id"] = rid
+        except Exception as e:
+            print(f"[BT] EXCEPTION: {e}", flush=True)
+            import traceback; traceback.print_exc()
+            bt = {"error": str(e), "_run_id": rid}
         with state_lock:
             state["backtest"] = bt
+        print(f"[BT] Done — state updated", flush=True)
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "running", "days": days})
+    return jsonify({"status": "running", "days": days, "run_id": run_id})
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
@@ -3594,6 +4179,7 @@ def zerodha_callback():
             kite_session = kc
         _save_token(data["access_token"])
         log.info(f"✅ Manual login: {profile.get('user_name')}")
+        fetch_lot_size()
         # Trigger scan + backtest
         def _post():
             time.sleep(1); bt = run_backtest()
@@ -3641,6 +4227,46 @@ def api_strategies_compare():
 def api_strategies_result():
     with state_lock:
         return jsonify(state.get("last_comparison", {}))
+
+@app.route("/api/paper/history")
+def api_paper_history():
+    """Query closed trades with filters: days, result, strategy."""
+    days     = int(request.args.get("days", 30))
+    result   = request.args.get("result", "")
+    strategy = request.args.get("strategy", "")
+
+    conn = _pg_conn()
+    if conn:
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                where = ["status = 'CLOSED'"]
+                if days < 999:
+                    where.append(f"closed_at >= NOW() - INTERVAL '{days} days'")
+                if result:
+                    where.append(f"data->>'result' = '{result}'")
+                if strategy:
+                    where.append(f"data->>'strategy' ILIKE '%{strategy}%'")
+                sql = ("SELECT data FROM paper_trades WHERE " +
+                       " AND ".join(where) +
+                       " ORDER BY closed_at DESC LIMIT 500")
+                cur.execute(sql)
+                trades = [dict(r["data"]) for r in cur.fetchall()]
+            conn.close()
+            return jsonify({"trades": trades, "source": "db"})
+        except Exception as e:
+            log.warning(f"History query failed: {e}")
+            try: conn.close()
+            except: pass
+
+    # Fallback: filter from in-memory closed trades
+    with paper_lock:
+        trades = list(paper_state["closed_trades"])
+    if result:
+        trades = [t for t in trades if t.get("result") == result]
+    if strategy:
+        trades = [t for t in trades if strategy.lower() in (t.get("strategy") or "").lower()]
+    return jsonify({"trades": trades[:200], "source": "memory"})
+
 
 @app.route("/zerodha/logout", methods=["POST"])
 def zerodha_logout():

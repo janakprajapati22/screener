@@ -6,3 +6,4 @@ kite_token.json
 paper_trades.json
 *.log
 .DS_Store
+.env
